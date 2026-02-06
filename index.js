@@ -93,6 +93,13 @@ function stripLinePrefix(t) {
     return String(t || "").replace(/^[-•\d.)\s]+/, "").trim();
 }
 
+function withTimeout(promise, ms, label="timeout") {
+    return Promise.race([
+        promise,
+        new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms))
+    ]);
+}
+
 function wordCount(str) {
     const s = String(str || "").trim();
     if (!s) return 0;
@@ -522,68 +529,46 @@ app.post("/status", async (req, res) => {
 
 app.post("/classify", async (req, res) => {
     try {
-        console.log("🖼️ /classify bytes", (req.body?.imageDataUrl || "").length);
         const { imageDataUrl } = req.body;
-        if (!imageDataUrl || typeof imageDataUrl !== "string") return res.json({ ok: false });
-
-        const r = await client.responses.create({
-            model: CONFIG.CLASSIFY_MODEL,
-            input: [
-                { role: "system", content: "Classify the main subject in the image." },
-                {
-                    role: "user",
-                    content: [
-                        {
-                            type: "input_text",
-                            text:
-                                "Return JSON only with:\n" +
-                                "- ok: boolean\n" +
-                                "- category: 'human' or 'animal'\n" +
-                                "- label:\n" +
-                                "   • if human -> 'man' or 'woman'\n" +
-                                "   • if animal -> a simple lowercase species word (e.g. dog, cat, rabbit, horse, bird)\n" +
-                                "Rules:\n" +
-                                "• If unsure, ok=false.\n" +
-                                "• label must be lowercase letters only.\n" +
-                                "• Avoid generic labels like 'animal' or 'pet'.",
-                        },
-                        { type: "input_image", image_url: imageDataUrl, detail: "low" },
-                    ],
-                },
-            ],
-            text: {
-                format: {
-                    type: "json_schema",
-                    strict: true,
-                    name: "classify",
-                    schema: {
-                        type: "object",
-                        additionalProperties: false,
-                        properties: {
-                            ok: { type: "boolean" },
-                            category: { type: "string", enum: ["human", "animal"] },
-                            label: { type: "string", pattern: "^[a-z]+$", minLength: 2, maxLength: 24 },
-                        },
-                        required: ["ok", "category", "label"],
-                    },
-                },
-            },
-        });
-
-        const parsed = JSON.parse(r.output_text || "{}");
-        if (!parsed?.ok || !parsed?.label) return res.json({ ok: false, reason: "not_detected" });
-
-        parsed.label = normalizeLabel(parsed.label);
-
-        const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
-        if (!isValidLabel(parsed.label) || blocked.has(parsed.label)) {
-            return res.json({ ok: false, reason: "invalid_label" });
+        if (!imageDataUrl || typeof imageDataUrl !== "string") {
+            return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
         }
 
-        return res.json(parsed);
+        // 1) Fast path: tags
+        const tags = await withTimeout(enrichImage(imageDataUrl), 12000, "enrich timeout");
+        const tagSet = new Set((tags || []).map(t => String(t).toLowerCase()));
+
+        // crude but effective mapping
+        const has = (t) => tagSet.has(t);
+        let label = null;
+        let category = null;
+
+        if (has("dog")) { label = "dog"; category = "animal"; }
+        else if (has("cat")) { label = "cat"; category = "animal"; }
+        else if (has("horse")) { label = "horse"; category = "animal"; }
+        else if (has("bird")) { label = "bird"; category = "animal"; }
+        else if (has("rabbit")) { label = "rabbit"; category = "animal"; }
+        else if (has("fish")) { label = "fish"; category = "animal"; }
+        else if (has("hamster")) { label = "hamster"; category = "animal"; }
+        else if (has("person") || has("man") || has("woman")) {
+            // if tags include man/woman use them, else default to person -> ok=false
+            if (has("man")) { label = "man"; category = "human"; }
+            else if (has("woman")) { label = "woman"; category = "human"; }
+        }
+
+        if (label && category) {
+            return res.json({ ok: true, category, label, source: "tags" });
+        }
+
+        console.log("🖼️ /classify bytes", (req.body?.imageDataUrl || "").length);
+
+        // 2) Slow path: strict classify (optional)
+        // If you keep it, wrap it with a timeout (see below)
+        return res.json({ ok: false, reason: "not_detected", tags, source: "tags" });
+
     } catch (e) {
-        console.error("Server error in /classify:", e);
-        res.status(500).json({ ok: false });
+        console.error("classify error", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
 
