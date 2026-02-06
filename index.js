@@ -522,6 +522,7 @@ app.post("/status", async (req, res) => {
 
 app.post("/classify", async (req, res) => {
     try {
+        console.log("🖼️ /classify bytes", (req.body?.imageDataUrl || "").length);
         const { imageDataUrl } = req.body;
         if (!imageDataUrl || typeof imageDataUrl !== "string") return res.json({ ok: false });
 
