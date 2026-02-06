@@ -564,45 +564,31 @@ app.post("/thought-free", async (req, res) => {
 });
 
 app.post("/thought-pro", async (req, res) => {
+    console.log("🧠 /thought-pro start");
+
     try {
         const deviceId = requireDeviceId(req);
-        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+        console.log("✔ deviceId", deviceId);
 
         const { label, imageDataUrl } = req.body;
-        const clean = normalizeLabel(label);
+        console.log("✔ label", label, "image?", !!imageDataUrl);
 
-        if (!isValidLabel(clean) || !imageDataUrl) {
-            return res.json({ ok: false, error: "BAD_REQUEST" });
-        }
-
-        // Atomic spend first
+        console.log("⏳ spend credits");
         const spend = await sbSpendCredits(deviceId, 1);
-        if (!spend.ok) {
-            return res.json({ ok: false, error: "PRO_LIMIT_REACHED", remainingPro: spend.remainingPro ?? 0 });
-        }
+        console.log("✔ spend result", spend);
 
+        console.log("⏳ enrich image");
         const tags = await enrichImage(imageDataUrl);
-        const thought = await generateProThought(clean, tags);
+        console.log("✔ tags", tags);
 
-        if (!thought || typeof thought !== "string") {
-            // Optional refund if generation fails
-            await sbGrantCredits(deviceId, 1).catch(() => {});
-            return res.json({ ok: false, error: "PRO_FAILED" });
-        }
+        console.log("⏳ generate thought");
+        const thought = await generateProThought(normalizeLabel(label), tags);
+        console.log("✔ thought ok");
 
-        return res.json({
-            ok: true,
-            thought,
-            tags,
-            tier: "pro",
-            source: "supabase",
-            remainingPro: spend.remainingPro,
-            proTokens: spend.proTokens,
-            proUsed: spend.proUsed,
-        });
+        return res.json({ ok: true, thought, tags, remainingPro: spend.remainingPro });
     } catch (e) {
-        console.error("Server error in /thought-pro:", e);
-        res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+        console.error("❌ /thought-pro error:", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
 
