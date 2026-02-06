@@ -36,7 +36,6 @@ const CONFIG = {
     PREWARM_ON_START: true,
     PREWARM_CHECK_INTERVAL_MINUTES: 60,
 
-    // New users start with this many Smart Thoughts
     DEFAULT_PRO_BALANCE: Number(process.env.DEFAULT_PRO_BALANCE || 5),
 };
 
@@ -69,7 +68,7 @@ function requireDeviceId(req) {
 // ======================
 // Helpers
 // ======================
-const utcDayKey = () => new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+const utcDayKey = () => new Date().toISOString().slice(0, 10);
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const cleanLabel = (l) => String(l || "").trim().toLowerCase();
 const isValidLabel = (l) => /^[a-z]{2,24}$/.test(l);
@@ -156,11 +155,11 @@ function filterWithAutoRelax(text, { minWords, maxWords, labelForLogs = "unknown
 }
 
 // ======================
-// Supabase bank helpers (NEW)
-// Table: thought_banks(label text, day date, thoughts text[])
+// Supabase bank helpers
+// Table: thought_banks(label text, bank_date date, thoughts text[])
 // ======================
 async function sbGetTodaysBank(label) {
-    const bankDate = utcDayKey(); // YYYY-MM-DD
+    const bankDate = utcDayKey();
 
     const { data, error } = await supabase
         .from("thought_banks")
@@ -191,11 +190,7 @@ async function sbUpsertBank(label, thoughts) {
     const { error } = await supabase
         .from("thought_banks")
         .upsert(
-            {
-                label,
-                bank_date: bankDate,
-                thoughts: cleanThoughts, // jsonb array
-            },
+            { label, bank_date: bankDate, thoughts: cleanThoughts },
             { onConflict: "label,bank_date" }
         );
 
@@ -203,7 +198,7 @@ async function sbUpsertBank(label, thoughts) {
 }
 
 // ======================
-// Generation
+// Generation (Free bank)
 // ======================
 async function generateThoughtBatch(label, count) {
     const minW = CONFIG.FREE_THOUGHT_MIN_WORDS;
@@ -241,26 +236,20 @@ async function generateThoughtBatch(label, count) {
         resp.output?.[0]?.content?.find((c) => c.type === "output_text")?.text ||
         "";
 
-    const { lines } = filterWithAutoRelax(text, {
-        minWords: minW,
-        maxWords: maxW,
-        labelForLogs: label,
-    });
-
+    const { lines } = filterWithAutoRelax(text, { minWords: minW, maxWords: maxW, labelForLogs: label });
     return lines.map(ensureSingleEndingEmoji);
 }
 
 // ======================
-// Daily bank builder (Supabase-backed)
+// Daily bank builder
 // ======================
 const bankBuildLocks = new Set();
 
 async function buildBankInBackground(label) {
     if (!label || !isValidLabel(label)) return;
-
     if (bankBuildLocks.has(label)) return;
-    bankBuildLocks.add(label);
 
+    bankBuildLocks.add(label);
     try {
         const existing = await sbGetTodaysBank(label).catch(() => null);
         if (existing?.length) return;
@@ -309,7 +298,6 @@ async function prewarmHotLabels() {
 
     if (!labels.length) return;
 
-    // Fire-and-forget build, but only when needed
     for (const label of labels) {
         const existing = await sbGetTodaysBank(label).catch(() => null);
         if (!existing?.length) buildBankInBackground(label);
@@ -317,7 +305,7 @@ async function prewarmHotLabels() {
 }
 
 // ======================
-// 🧠 ENRICHMENT (PRO ONLY)
+// 🧠 ENRICHMENT (used for classify + pro)
 // ======================
 async function enrichImage(imageDataUrl) {
     const r = await client.responses.create({
@@ -327,7 +315,7 @@ async function enrichImage(imageDataUrl) {
                 role: "system",
                 content:
                     "You are a visual analyst for a family-friendly humour app. " +
-                    "Return JSON only. Be concise. If unsure, pick the best guess."
+                    "Return JSON only. Be concise. If unsure, pick the best guess.",
             },
             {
                 role: "user",
@@ -347,7 +335,7 @@ async function enrichImage(imageDataUrl) {
                             '  "extra_tags": ["short", "descriptive", "words"],\n' +
                             '  "vibe": "2-5 words"\n' +
                             "}\n" +
-                            "Rules: keep arrays short (max 6). No sentences."
+                            "Rules: keep arrays short (max 6). No sentences.",
                     },
                     { type: "input_image", image_url: imageDataUrl, detail: "high" },
                 ],
@@ -382,7 +370,24 @@ async function enrichImage(imageDataUrl) {
     return JSON.parse(r.output_text || "{}");
 }
 
+// ✅ FIXED: matches enrichImage schema (subject is a STRING)
+function classifyFromEnrich(enrich) {
+    if (!enrich || typeof enrich.subject !== "string") {
+        return { ok: false, reason: "no_subject" };
+    }
 
+    const label = normalizeLabel(enrich.subject);
+
+    if (!label || label === "other") return { ok: false, reason: "other" };
+
+    const category = (label === "man" || label === "woman") ? "human" : "animal";
+
+    return { ok: true, category, label };
+}
+
+// ======================
+// Pro thought generator
+// ======================
 async function generateProThought(label, enrich) {
     const minW = CONFIG.PRO_THOUGHT_MIN_WORDS;
     const maxW = CONFIG.PRO_THOUGHT_MAX_WORDS;
@@ -398,7 +403,7 @@ async function generateProThought(label, enrich) {
                     "No mention of photo/camera/app/user/viewer. " +
                     "Use UK humour/wording. No profanity/hate/sexual content. " +
                     `Length: ${minW}-${maxW} words. ` +
-                    "End with exactly ONE fitting emoji at the very end."
+                    "End with exactly ONE fitting emoji at the very end.",
             },
             {
                 role: "user",
@@ -425,7 +430,7 @@ async function generateProThought(label, enrich) {
 }
 
 // ======================
-// Supabase usage helpers (you already have these)
+// Supabase usage helpers
 // ======================
 async function sbGetStatus(deviceId) {
     const { data: existing, error: selErr } = await supabase
@@ -496,38 +501,6 @@ async function sbSpendCredits(deviceId, cost) {
     };
 }
 
-function classifyFromEnrich(enrich) {
-    // Adjust these fields to match YOUR enrich output
-    // Example assumptions (edit as needed):
-    // enrich.subject = { category: "animal"|"human", label: "dog"|"cat"|"man"|"woman", confidence: 0.92 }
-    // or enrich.species = "dog", enrich.isHuman = false
-
-    if (!enrich) return { ok: false, reason: "no_enrich" };
-
-    // Case 1: enrich already gives you what you need
-    if (enrich.subject?.category && enrich.subject?.label) {
-        const category = enrich.subject.category;
-        let label = normalizeLabel(enrich.subject.label);
-
-        return { ok: true, category, label };
-    }
-
-    // Case 2: enrich gives species / isHuman style fields
-    if (enrich.isHuman === true) {
-        // If you can infer man/woman from enrich, do it here; otherwise return ok=false
-        // (or do a tiny follow-up model call just for gender if you want)
-        return { ok: false, reason: "human_gender_unknown" };
-    }
-
-    if (typeof enrich.species === "string" && enrich.species.length) {
-        const label = normalizeLabel(enrich.species);
-        return { ok: true, category: "animal", label };
-    }
-
-    return { ok: false, reason: "not_detected" };
-}
-
-
 // ======================
 // Routes
 // ======================
@@ -553,30 +526,32 @@ app.post("/status", async (req, res) => {
 });
 
 app.post("/classify", async (req, res) => {
+    const t0 = Date.now();
     try {
-        console.log("🖼️ /classify bytes", (req.body?.imageDataUrl || "").length);
-
         const { imageDataUrl } = req.body;
+        const len = (imageDataUrl || "").length;
+        console.log("🖼️ /classify bytes", len);
+
         if (!imageDataUrl || typeof imageDataUrl !== "string") {
             return res.status(400).json({ ok: false, reason: "BAD_REQUEST" });
         }
 
         console.log("⏳ classify via enrich");
-        const enrich = await enrichImage(imageDataUrl); // ✅ same path as thought-pro
+        const enrich = await enrichImage(imageDataUrl);
+
         const out = classifyFromEnrich(enrich);
+        if (!out.ok) return res.json({ ...out, ms: Date.now() - t0, enrich });
 
-        if (!out.ok) return res.json(out);
-
-        // Keep your existing safety validation
+        // Safety validation
         const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
         if (!isValidLabel(out.label) || blocked.has(out.label)) {
-            return res.json({ ok: false, reason: "invalid_label" });
+            return res.json({ ok: false, reason: "invalid_label", ms: Date.now() - t0, enrich });
         }
 
-        return res.json(out);
+        return res.json({ ...out, ms: Date.now() - t0, enrich });
     } catch (e) {
         console.error("Server error in /classify:", e);
-        return res.status(500).json({ ok: false, reason: "SERVER_ERROR" });
+        return res.status(500).json({ ok: false, reason: "SERVER_ERROR", ms: Date.now() - t0 });
     }
 });
 
@@ -585,18 +560,14 @@ app.post("/thought-pro", async (req, res) => {
 
     try {
         const deviceId = requireDeviceId(req);
-        if (!deviceId) {
-            return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
-        }
+        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
         console.log("✔ deviceId", deviceId);
 
         const { label, imageDataUrl } = req.body;
-        if (!label || !imageDataUrl) {
-            return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
-        }
+        if (!label || !imageDataUrl) return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
         console.log("✔ label", label, "image?", !!imageDataUrl);
 
-        // 1️⃣ Spend credit first (atomic)
+        // 1) Spend credit first (atomic)
         console.log("⏳ spend credits");
         const spend = await sbSpendCredits(deviceId, 1);
         console.log("✔ spend result", spend);
@@ -609,23 +580,20 @@ app.post("/thought-pro", async (req, res) => {
             });
         }
 
-        // 2️⃣ Enrich image (behaviour + expression)
+        // 2) Enrich image (behaviour + expression)
         console.log("⏳ enrich image");
         const enrich = await enrichImage(imageDataUrl);
         console.log("✔ enrich", enrich);
 
-        // 3️⃣ Generate personality-driven thought
+        // 3) Generate personality-driven thought
         console.log("⏳ generate thought");
-        const thought = await generateProThought(
-            normalizeLabel(label),
-            enrich
-        );
+        const thought = await generateProThought(normalizeLabel(label), enrich);
         console.log("✔ thought ok");
 
         return res.json({
             ok: true,
             thought,
-            enrich,                 // 🔥 return this for debugging / tuning
+            enrich,
             remainingPro: spend.remainingPro,
             tier: "pro",
         });
@@ -649,7 +617,7 @@ app.post("/thought-free", async (req, res) => {
 
         let thoughts = await sbGetTodaysBank(label).catch(() => null);
         if (!thoughts) {
-            buildBankInBackground(label);       // kick off now
+            buildBankInBackground(label);
             thoughts = await ensureDailyBank(label);
         }
 
