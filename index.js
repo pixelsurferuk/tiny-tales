@@ -13,35 +13,30 @@ app.use(express.json({ limit: "12mb" }));
 // 🔧 CONFIG
 // ======================
 const CONFIG = {
-    // Bank system
     BANK_DAILY_SIZE: 100,
     BANK_LEARN_BATCH_SIZE: 25,
     BANK_LEARN_MIN_ACCEPT: 30,
 
-    // Thought length rules (WORDS)
     FREE_THOUGHT_MIN_WORDS: 5,
     FREE_THOUGHT_MAX_WORDS: 15,
 
     PRO_THOUGHT_MIN_WORDS: 10,
     PRO_THOUGHT_MAX_WORDS: 35,
 
-    // Auto-relax behaviour
     RELAX_1_DELTA_MIN_WORDS: 2,
     RELAX_1_DELTA_MAX_WORDS: 4,
     RELAX_2_DELTA_MIN_WORDS: 3,
     RELAX_2_DELTA_MAX_WORDS: 8,
 
-    // Models
     CLASSIFY_MODEL: "gpt-4o-mini",
     THOUGHT_MODEL: "gpt-4o-mini",
 
-    // Prewarm (hot labels)
     PREWARM_ENABLED: true,
     PREWARM_LABELS: ["man", "woman", "dog", "cat", "rabbit", "hamster", "fish", "bird", "horse"],
     PREWARM_ON_START: true,
     PREWARM_CHECK_INTERVAL_MINUTES: 60,
 
-    // ✅ New users start with this many Smart Thoughts
+    // New users start with this many Smart Thoughts
     DEFAULT_PRO_BALANCE: Number(process.env.DEFAULT_PRO_BALANCE || 5),
 };
 
@@ -54,7 +49,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    console.warn("⚠️ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY. Endpoints will fail.");
+    console.warn("⚠️ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY. Supabase endpoints will fail.");
 }
 
 const supabase = createClient(
@@ -72,9 +67,9 @@ function requireDeviceId(req) {
 }
 
 // ======================
-// Label helpers
+// Helpers
 // ======================
-const utcDayKey = () => new Date().toISOString().slice(0, 10);
+const utcDayKey = () => new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const cleanLabel = (l) => String(l || "").trim().toLowerCase();
 const isValidLabel = (l) => /^[a-z]{2,24}$/.test(l);
@@ -161,7 +156,54 @@ function filterWithAutoRelax(text, { minWords, maxWords, labelForLogs = "unknown
 }
 
 // ======================
-// Generation (FREE bank)
+// Supabase bank helpers (NEW)
+// Table: thought_banks(label text, day date, thoughts text[])
+// ======================
+async function sbGetTodaysBank(label) {
+    const bankDate = utcDayKey(); // YYYY-MM-DD
+
+    const { data, error } = await supabase
+        .from("thought_banks")
+        .select("thoughts")
+        .eq("label", label)
+        .eq("bank_date", bankDate)
+        .maybeSingle();
+
+    if (error) throw error;
+
+    const thoughts = data?.thoughts;
+    if (!Array.isArray(thoughts) || thoughts.length === 0) return null;
+
+    return thoughts
+        .filter((t) => typeof t === "string")
+        .map((t) => t.trim())
+        .filter(Boolean);
+}
+
+async function sbUpsertBank(label, thoughts) {
+    const bankDate = utcDayKey();
+
+    const cleanThoughts = (thoughts || [])
+        .filter((t) => typeof t === "string")
+        .map((t) => t.trim())
+        .filter(Boolean);
+
+    const { error } = await supabase
+        .from("thought_banks")
+        .upsert(
+            {
+                label,
+                bank_date: bankDate,
+                thoughts: cleanThoughts, // jsonb array
+            },
+            { onConflict: "label,bank_date" }
+        );
+
+    if (error) throw error;
+}
+
+// ======================
+// Generation
 // ======================
 async function generateThoughtBatch(label, count) {
     const minW = CONFIG.FREE_THOUGHT_MIN_WORDS;
@@ -209,67 +251,21 @@ async function generateThoughtBatch(label, count) {
 }
 
 // ======================
-// ✅ Supabase THOUGHT BANK helpers
+// Daily bank builder (Supabase-backed)
 // ======================
-
-async function sbGetTodaysBank(label) {
-    const { data, error } = await supabase.rpc("get_thought_bank_today", {
-        p_label: label,
-    });
-
-    if (error) throw error;
-
-    const row = Array.isArray(data) ? data[0] : data;
-    const thoughts = row?.thoughts;
-
-    if (!thoughts) return null;
-
-    // thoughts is jsonb array → turn into string[]
-    if (Array.isArray(thoughts)) return thoughts;
-    if (typeof thoughts === "string") {
-        // just in case
-        try {
-            const parsed = JSON.parse(thoughts);
-            return Array.isArray(parsed) ? parsed : null;
-        } catch {
-            return null;
-        }
-    }
-
-    return null;
-}
-
-async function sbUpsertTodaysBank(label, thoughtsArray) {
-    const { data, error } = await supabase.rpc("upsert_thought_bank_today", {
-        p_label: label,
-        p_thoughts: thoughtsArray, // supabase-js will send as json
-    });
-
-    if (error) throw error;
-
-    const row = Array.isArray(data) ? data[0] : data;
-    const thoughts = row?.thoughts;
-    return Array.isArray(thoughts) ? thoughts : thoughtsArray;
-}
-
-// Prevent multiple concurrent bank builds per label (in-process lock)
 const bankBuildLocks = new Set();
 
 async function buildBankInBackground(label) {
     if (!label || !isValidLabel(label)) return;
 
-    const today = utcDayKey();
-    const lockKey = `${label}:${today}`;
-
-    if (bankBuildLocks.has(lockKey)) return;
-    bankBuildLocks.add(lockKey);
+    if (bankBuildLocks.has(label)) return;
+    bankBuildLocks.add(label);
 
     try {
-        // If already exists in DB, bail
-        const existing = await sbGetTodaysBank(label);
+        const existing = await sbGetTodaysBank(label).catch(() => null);
         if (existing?.length) return;
 
-        console.log(`📚 Building daily bank for '${label}'...`);
+        console.log(`📚 Building daily bank for '${label}' (Supabase)...`);
 
         let thoughts = [];
         while (thoughts.length < CONFIG.BANK_DAILY_SIZE) {
@@ -286,21 +282,21 @@ async function buildBankInBackground(label) {
             return;
         }
 
-        await sbUpsertTodaysBank(label, thoughts);
-        console.log(`✅ Bank ready for '${label}' (${thoughts.length})`);
+        await sbUpsertBank(label, thoughts);
+        console.log(`✅ Bank saved for '${label}' (${thoughts.length})`);
     } catch (e) {
         console.error("Bank build error:", e);
     } finally {
-        bankBuildLocks.delete(lockKey);
+        bankBuildLocks.delete(label);
     }
 }
 
 async function ensureDailyBank(label) {
-    const existing = await sbGetTodaysBank(label);
+    const existing = await sbGetTodaysBank(label).catch(() => null);
     if (existing?.length) return existing;
 
     await buildBankInBackground(label);
-    return (await sbGetTodaysBank(label)) || [];
+    return (await sbGetTodaysBank(label).catch(() => null)) || [];
 }
 
 async function prewarmHotLabels() {
@@ -313,10 +309,10 @@ async function prewarmHotLabels() {
 
     if (!labels.length) return;
 
-    console.log("🔥 Prewarming labels:", labels.join(", "));
+    // Fire-and-forget build, but only when needed
     for (const label of labels) {
-        // fire-and-forget
-        buildBankInBackground(label);
+        const existing = await sbGetTodaysBank(label).catch(() => null);
+        if (!existing?.length) buildBankInBackground(label);
     }
 }
 
@@ -381,7 +377,7 @@ async function generateProThought(label, tags) {
 }
 
 // ======================
-// Supabase usage helpers (YOUR EXISTING)
+// Supabase usage helpers (you already have these)
 // ======================
 async function sbGetStatus(deviceId) {
     const { data: existing, error: selErr } = await supabase
@@ -547,11 +543,10 @@ app.post("/thought-free", async (req, res) => {
         const label = normalizeLabel(req.body.label);
         if (!isValidLabel(label)) return res.json({ ok: false });
 
-        // ✅ Supabase daily bank now
-        let thoughts = await sbGetTodaysBank(label);
+        let thoughts = await sbGetTodaysBank(label).catch(() => null);
         if (!thoughts) {
-            buildBankInBackground(label); // start now
-            thoughts = await ensureDailyBank(label); // try to satisfy request
+            buildBankInBackground(label);       // kick off now
+            thoughts = await ensureDailyBank(label);
         }
 
         if (!thoughts?.length) return res.json({ ok: false, error: "NO_BANK_YET" });
@@ -560,7 +555,7 @@ app.post("/thought-free", async (req, res) => {
             ok: true,
             thought: pick(thoughts),
             tier: "free",
-            source: "supabase-daily-bank",
+            source: "supabase-bank",
         });
     } catch (e) {
         console.error("Server error in /thought-free:", e);
@@ -580,7 +575,7 @@ app.post("/thought-pro", async (req, res) => {
             return res.json({ ok: false, error: "BAD_REQUEST" });
         }
 
-        // ✅ Atomic spend first
+        // Atomic spend first
         const spend = await sbSpendCredits(deviceId, 1);
         if (!spend.ok) {
             return res.json({ ok: false, error: "PRO_LIMIT_REACHED", remainingPro: spend.remainingPro ?? 0 });
@@ -590,7 +585,7 @@ app.post("/thought-pro", async (req, res) => {
         const thought = await generateProThought(clean, tags);
 
         if (!thought || typeof thought !== "string") {
-            // Refund if generation fails (nice touch)
+            // Optional refund if generation fails
             await sbGrantCredits(deviceId, 1).catch(() => {});
             return res.json({ ok: false, error: "PRO_FAILED" });
         }
@@ -611,7 +606,6 @@ app.post("/thought-pro", async (req, res) => {
     }
 });
 
-// DEV purchase simulator
 app.post("/dev/add-credits", async (req, res) => {
     try {
         const { deviceId, amount } = req.body || {};
