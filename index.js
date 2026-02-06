@@ -323,27 +323,67 @@ async function enrichImage(imageDataUrl) {
     const r = await client.responses.create({
         model: CONFIG.CLASSIFY_MODEL,
         input: [
-            { role: "system", content: "Return short visual tags only. No sentences." },
+            {
+                role: "system",
+                content:
+                    "You are a visual analyst for a family-friendly humour app. " +
+                    "Return JSON only. Be concise. If unsure, pick the best guess."
+            },
             {
                 role: "user",
                 content: [
-                    { type: "input_text", text: "Return 5-10 comma-separated tags (e.g. sunny, indoors, laptop, sofa)." },
-                    { type: "input_image", image_url: imageDataUrl, detail: "low" },
+                    {
+                        type: "input_text",
+                        text:
+                            "Analyse the subject and their behaviour. Return JSON with:\n" +
+                            "{\n" +
+                            '  "subject": "dog|cat|man|woman|other",\n' +
+                            '  "action": "sleeping|yawning|chewing|staring|playing|posing|walking|eating|begging|other",\n' +
+                            '  "expression": "happy|sleepy|suspicious|annoyed|excited|guilty|confused|neutral|other",\n' +
+                            '  "gaze": "at_camera|away|side_eye|up|down|unknown",\n' +
+                            '  "pose": "lying|sitting|standing|curled|sprawled|unknown",\n' +
+                            '  "setting": ["indoors|outdoors", "sofa|bed|car|garden|office|street|other"],\n' +
+                            '  "props": ["toy","food","leash","phone","laptop","bowl","blanket","shoe","none"],\n' +
+                            '  "extra_tags": ["short", "descriptive", "words"],\n' +
+                            '  "vibe": "2-5 words"\n' +
+                            "}\n" +
+                            "Rules: keep arrays short (max 6). No sentences."
+                    },
+                    { type: "input_image", image_url: imageDataUrl, detail: "high" },
                 ],
             },
         ],
-        max_output_tokens: 120,
+        text: {
+            format: {
+                type: "json_schema",
+                strict: true,
+                name: "enrichment",
+                schema: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                        subject: { type: "string" },
+                        action: { type: "string" },
+                        expression: { type: "string" },
+                        gaze: { type: "string" },
+                        pose: { type: "string" },
+                        setting: { type: "array", items: { type: "string" }, maxItems: 2 },
+                        props: { type: "array", items: { type: "string" }, maxItems: 6 },
+                        extra_tags: { type: "array", items: { type: "string" }, maxItems: 6 },
+                        vibe: { type: "string" },
+                    },
+                    required: ["subject", "action", "expression", "gaze", "pose", "setting", "props", "extra_tags", "vibe"],
+                },
+            },
+        },
+        max_output_tokens: 220,
     });
 
-    const text = (r.output_text || "").trim();
-    return text
-        .split(",")
-        .map((t) => t.trim().toLowerCase())
-        .filter(Boolean)
-        .slice(0, 10);
+    return JSON.parse(r.output_text || "{}");
 }
 
-async function generateProThought(label, tags) {
+
+async function generateProThought(label, enrich) {
     const minW = CONFIG.PRO_THOUGHT_MIN_WORDS;
     const maxW = CONFIG.PRO_THOUGHT_MAX_WORDS;
 
@@ -354,19 +394,27 @@ async function generateProThought(label, tags) {
                 role: "system",
                 content:
                     "Write ONE funny, personality-rich inner thought for a family app. " +
-                    "IMPORTANT: It MUST be in first-person as the subject in the image (the character). " +
-                    "Use 'I/me/my' language. Never write as an observer or narrator. " +
-                    "Do NOT mention 'photo', 'picture', 'camera', 'app', 'user', 'viewer'. " +
-                    "Use UK humour/wording. No profanity, hate, sexual content. " +
+                    "Must be first-person as the subject in the image. Use I/me/my. " +
+                    "No mention of photo/camera/app/user/viewer. " +
+                    "Use UK humour/wording. No profanity/hate/sexual content. " +
                     `Length: ${minW}-${maxW} words. ` +
-                    "IMPORTANT: End the thought with exactly ONE fitting emoji at the very end. Do not add emojis elsewhere.",
+                    "End with exactly ONE fitting emoji at the very end."
             },
             {
                 role: "user",
                 content:
                     `You are a ${label}.\n` +
-                    `Scene tags (your surroundings): ${tags.join(", ")}\n` +
-                    `Write the thought as your private inner monologue.`,
+                    `Behaviour:\n` +
+                    `- action: ${enrich.action}\n` +
+                    `- expression: ${enrich.expression}\n` +
+                    `- gaze: ${enrich.gaze}\n` +
+                    `- pose: ${enrich.pose}\n` +
+                    `Scene:\n` +
+                    `- setting: ${(enrich.setting || []).join(", ")}\n` +
+                    `- props: ${(enrich.props || []).join(", ")}\n` +
+                    `- extra: ${(enrich.extra_tags || []).join(", ")}\n` +
+                    `- vibe: ${enrich.vibe}\n` +
+                    `Write an inner thought that clearly reflects the action + expression + gaze (not just the room).`,
             },
         ],
         max_output_tokens: 160,
@@ -568,29 +616,63 @@ app.post("/thought-pro", async (req, res) => {
 
     try {
         const deviceId = requireDeviceId(req);
+        if (!deviceId) {
+            return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+        }
         console.log("✔ deviceId", deviceId);
 
         const { label, imageDataUrl } = req.body;
+        if (!label || !imageDataUrl) {
+            return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
+        }
         console.log("✔ label", label, "image?", !!imageDataUrl);
 
+        // 1️⃣ Spend credit first (atomic)
         console.log("⏳ spend credits");
         const spend = await sbSpendCredits(deviceId, 1);
         console.log("✔ spend result", spend);
 
-        console.log("⏳ enrich image");
-        const tags = await enrichImage(imageDataUrl);
-        console.log("✔ tags", tags);
+        if (!spend.ok) {
+            return res.json({
+                ok: false,
+                error: "PRO_LIMIT_REACHED",
+                remainingPro: spend.remainingPro ?? 0,
+            });
+        }
 
+        // 2️⃣ Enrich image (behaviour + expression)
+        console.log("⏳ enrich image");
+        const enrich = await enrichImage(imageDataUrl);
+        console.log("✔ enrich", enrich);
+
+        // 3️⃣ Generate personality-driven thought
         console.log("⏳ generate thought");
-        const thought = await generateProThought(normalizeLabel(label), tags);
+        const thought = await generateProThought(
+            normalizeLabel(label),
+            enrich
+        );
         console.log("✔ thought ok");
 
-        return res.json({ ok: true, thought, tags, remainingPro: spend.remainingPro });
+        return res.json({
+            ok: true,
+            thought,
+            enrich,                 // 🔥 return this for debugging / tuning
+            remainingPro: spend.remainingPro,
+            tier: "pro",
+        });
     } catch (e) {
         console.error("❌ /thought-pro error:", e);
+
+        // Optional refund safety net
+        try {
+            const deviceId = requireDeviceId(req);
+            if (deviceId) await sbGrantCredits(deviceId, 1);
+        } catch {}
+
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
+
 
 app.post("/dev/add-credits", async (req, res) => {
     try {
