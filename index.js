@@ -93,13 +93,6 @@ function stripLinePrefix(t) {
     return String(t || "").replace(/^[-•\d.)\s]+/, "").trim();
 }
 
-function withTimeout(promise, ms, label="timeout") {
-    return Promise.race([
-        promise,
-        new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms))
-    ]);
-}
-
 function wordCount(str) {
     const s = String(str || "").trim();
     if (!s) return 0;
@@ -503,6 +496,38 @@ async function sbSpendCredits(deviceId, cost) {
     };
 }
 
+function classifyFromEnrich(enrich) {
+    // Adjust these fields to match YOUR enrich output
+    // Example assumptions (edit as needed):
+    // enrich.subject = { category: "animal"|"human", label: "dog"|"cat"|"man"|"woman", confidence: 0.92 }
+    // or enrich.species = "dog", enrich.isHuman = false
+
+    if (!enrich) return { ok: false, reason: "no_enrich" };
+
+    // Case 1: enrich already gives you what you need
+    if (enrich.subject?.category && enrich.subject?.label) {
+        const category = enrich.subject.category;
+        let label = normalizeLabel(enrich.subject.label);
+
+        return { ok: true, category, label };
+    }
+
+    // Case 2: enrich gives species / isHuman style fields
+    if (enrich.isHuman === true) {
+        // If you can infer man/woman from enrich, do it here; otherwise return ok=false
+        // (or do a tiny follow-up model call just for gender if you want)
+        return { ok: false, reason: "human_gender_unknown" };
+    }
+
+    if (typeof enrich.species === "string" && enrich.species.length) {
+        const label = normalizeLabel(enrich.species);
+        return { ok: true, category: "animal", label };
+    }
+
+    return { ok: false, reason: "not_detected" };
+}
+
+
 // ======================
 // Routes
 // ======================
@@ -529,71 +554,29 @@ app.post("/status", async (req, res) => {
 
 app.post("/classify", async (req, res) => {
     try {
-        const { imageDataUrl } = req.body;
-        if (!imageDataUrl || typeof imageDataUrl !== "string") {
-            return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
-        }
-
-        // 1) Fast path: tags
-        const tags = await withTimeout(enrichImage(imageDataUrl), 12000, "enrich timeout");
-        const tagSet = new Set((tags || []).map(t => String(t).toLowerCase()));
-
-        // crude but effective mapping
-        const has = (t) => tagSet.has(t);
-        let label = null;
-        let category = null;
-
-        if (has("dog")) { label = "dog"; category = "animal"; }
-        else if (has("cat")) { label = "cat"; category = "animal"; }
-        else if (has("horse")) { label = "horse"; category = "animal"; }
-        else if (has("bird")) { label = "bird"; category = "animal"; }
-        else if (has("rabbit")) { label = "rabbit"; category = "animal"; }
-        else if (has("fish")) { label = "fish"; category = "animal"; }
-        else if (has("hamster")) { label = "hamster"; category = "animal"; }
-        else if (has("person") || has("man") || has("woman")) {
-            // if tags include man/woman use them, else default to person -> ok=false
-            if (has("man")) { label = "man"; category = "human"; }
-            else if (has("woman")) { label = "woman"; category = "human"; }
-        }
-
-        if (label && category) {
-            return res.json({ ok: true, category, label, source: "tags" });
-        }
-
         console.log("🖼️ /classify bytes", (req.body?.imageDataUrl || "").length);
 
-        // 2) Slow path: strict classify (optional)
-        // If you keep it, wrap it with a timeout (see below)
-        return res.json({ ok: false, reason: "not_detected", tags, source: "tags" });
-
-    } catch (e) {
-        console.error("classify error", e);
-        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
-    }
-});
-
-app.post("/thought-free", async (req, res) => {
-    try {
-        const label = normalizeLabel(req.body.label);
-        if (!isValidLabel(label)) return res.json({ ok: false });
-
-        let thoughts = await sbGetTodaysBank(label).catch(() => null);
-        if (!thoughts) {
-            buildBankInBackground(label);       // kick off now
-            thoughts = await ensureDailyBank(label);
+        const { imageDataUrl } = req.body;
+        if (!imageDataUrl || typeof imageDataUrl !== "string") {
+            return res.status(400).json({ ok: false, reason: "BAD_REQUEST" });
         }
 
-        if (!thoughts?.length) return res.json({ ok: false, error: "NO_BANK_YET" });
+        console.log("⏳ classify via enrich");
+        const enrich = await enrichImage(imageDataUrl); // ✅ same path as thought-pro
+        const out = classifyFromEnrich(enrich);
 
-        return res.json({
-            ok: true,
-            thought: pick(thoughts),
-            tier: "free",
-            source: "supabase-bank",
-        });
+        if (!out.ok) return res.json(out);
+
+        // Keep your existing safety validation
+        const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
+        if (!isValidLabel(out.label) || blocked.has(out.label)) {
+            return res.json({ ok: false, reason: "invalid_label" });
+        }
+
+        return res.json(out);
     } catch (e) {
-        console.error("Server error in /thought-free:", e);
-        res.status(500).json({ ok: false });
+        console.error("Server error in /classify:", e);
+        return res.status(500).json({ ok: false, reason: "SERVER_ERROR" });
     }
 });
 
@@ -659,6 +642,30 @@ app.post("/thought-pro", async (req, res) => {
     }
 });
 
+app.post("/thought-free", async (req, res) => {
+    try {
+        const label = normalizeLabel(req.body.label);
+        if (!isValidLabel(label)) return res.json({ ok: false });
+
+        let thoughts = await sbGetTodaysBank(label).catch(() => null);
+        if (!thoughts) {
+            buildBankInBackground(label);       // kick off now
+            thoughts = await ensureDailyBank(label);
+        }
+
+        if (!thoughts?.length) return res.json({ ok: false, error: "NO_BANK_YET" });
+
+        return res.json({
+            ok: true,
+            thought: pick(thoughts),
+            tier: "free",
+            source: "supabase-bank",
+        });
+    } catch (e) {
+        console.error("Server error in /thought-free:", e);
+        res.status(500).json({ ok: false });
+    }
+});
 
 app.post("/dev/add-credits", async (req, res) => {
     try {
