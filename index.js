@@ -4,42 +4,11 @@ import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
+import crypto from "crypto";
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
-
-app.use((req, res, next) => {
-    const rid = req.headers["x-req-id"] || `srv_${Math.random().toString(16).slice(2)}`;
-    const clientSentAt = Number(req.headers["x-client-sent-at"] || 0);
-    const serverReceivedAt = Date.now();
-
-    req._rid = String(rid);
-    req._serverReceivedAt = serverReceivedAt;
-    req._clientSentAt = clientSentAt;
-
-    res.setHeader("x-req-id", req._rid);
-    res.setHeader("x-server-received-at", String(serverReceivedAt));
-
-    console.log(`[WIRE] recv ${req.method} ${req.path}`, {
-        rid: req._rid,
-        clientSentAt: clientSentAt || null,
-        serverReceivedAt,
-        deltaClientToServerMs: clientSentAt ? serverReceivedAt - clientSentAt : null,
-        contentLength: req.headers["content-length"] || null,
-    });
-
-    res.on("finish", () => {
-        console.log(`[WIRE] done ${req.method} ${req.path}`, {
-            rid: req._rid,
-            status: res.statusCode,
-            serverTotalMs: Date.now() - serverReceivedAt,
-        });
-    });
-
-    next();
-});
-
 
 // ======================
 // 🔧 CONFIG
@@ -70,9 +39,9 @@ const CONFIG = {
 
     DEFAULT_PRO_BALANCE: Number(process.env.DEFAULT_PRO_BALANCE || 5),
 
-    // 🔎 DEBUG LOGGING
-    // Set DEBUG_THOUGHT=1 in your Render env vars to enable extra logs.
-    DEBUG_THOUGHT: process.env.DEBUG_THOUGHT === "1",
+    // ✅ Subject-only cache (free)
+    SUBJECT_CACHE_TTL_MS: 10 * 60 * 1000, // 10 minutes
+    SUBJECT_CACHE_MAX: 2000,
 };
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -99,15 +68,6 @@ function requireDeviceId(req) {
     const trimmed = id.trim();
     if (trimmed.length < 3) return null;
     return trimmed;
-}
-
-function withTimeout(promise, ms, label = "timeout") {
-    return Promise.race([
-        promise,
-        new Promise((_, reject) =>
-            setTimeout(() => reject(new Error(`${label} after ${ms}ms`)), ms)
-        ),
-    ]);
 }
 
 // ======================
@@ -199,28 +159,34 @@ function filterWithAutoRelax(text, { minWords, maxWords, labelForLogs = "unknown
     return { lines, mode: "strict-empty" };
 }
 
-// ----------------------
-// Debug helpers
-// ----------------------
-function approxImageKbFromDataUrl(imageDataUrl) {
-    if (typeof imageDataUrl !== "string") return null;
-    const comma = imageDataUrl.indexOf(",");
-    const b64 = comma >= 0 ? imageDataUrl.slice(comma + 1) : imageDataUrl;
-    // base64 bytes ~ (len * 3/4) minus padding
-    const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
-    const bytes = Math.max(0, Math.floor((b64.length * 3) / 4) - padding);
-    return Math.round(bytes / 1024);
+// ======================
+// Subject-only cache (FREE)
+// ======================
+const subjectCache = new Map(); // key -> { label, subject, expiresAt }
+
+function subjectCacheKey(imageDataUrl) {
+    // sha1 of the full string is fine at ~150KB
+    return crypto.createHash("sha1").update(String(imageDataUrl || "")).digest("hex");
 }
 
-function shortDevice(id) {
-    if (!id || typeof id !== "string") return null;
-    if (id.length <= 8) return id;
-    return `${id.slice(0, 4)}…${id.slice(-3)}`;
+function subjectCacheGet(key) {
+    const v = subjectCache.get(key);
+    if (!v) return null;
+    if (Date.now() > v.expiresAt) {
+        subjectCache.delete(key);
+        return null;
+    }
+    return v;
 }
 
-function dbg(...args) {
-    if (!CONFIG.DEBUG_THOUGHT) return;
-    console.log(...args);
+function subjectCacheSet(key, value) {
+    // basic cap
+    if (subjectCache.size >= CONFIG.SUBJECT_CACHE_MAX) {
+        // delete one (oldest-ish: Map preserves insertion order)
+        const firstKey = subjectCache.keys().next().value;
+        if (firstKey) subjectCache.delete(firstKey);
+    }
+    subjectCache.set(key, value);
 }
 
 // ======================
@@ -298,7 +264,9 @@ async function generateThoughtBatch(label, count) {
     });
 
     const text =
-        resp.output_text || resp.output?.[0]?.content?.find((c) => c.type === "output_text")?.text || "";
+        resp.output_text ||
+        resp.output?.[0]?.content?.find((c) => c.type === "output_text")?.text ||
+        "";
 
     const { lines } = filterWithAutoRelax(text, { minWords: minW, maxWords: maxW, labelForLogs: label });
     return lines.map(ensureSingleEndingEmoji);
@@ -355,7 +323,11 @@ async function ensureDailyBank(label) {
 async function prewarmHotLabels() {
     if (!CONFIG.PREWARM_ENABLED) return;
 
-    const labels = (CONFIG.PREWARM_LABELS || []).map(normalizeLabel).map(cleanLabel).filter(isValidLabel);
+    const labels = (CONFIG.PREWARM_LABELS || [])
+        .map(normalizeLabel)
+        .map(cleanLabel)
+        .filter(isValidLabel);
+
     if (!labels.length) return;
 
     for (const label of labels) {
@@ -373,9 +345,7 @@ async function enrichImage(imageDataUrl) {
         input: [
             {
                 role: "system",
-                content:
-                    "You are a visual analyst for a family-friendly humour app. " +
-                    "Return JSON only. Be concise. If unsure, pick the best guess.",
+                content: "You are a visual analyst for a family-friendly humour app. Return JSON only. Be concise. If unsure, pick the best guess.",
             },
             {
                 role: "user",
@@ -436,16 +406,25 @@ function classifyFromEnrich(enrich) {
     }
 
     const label = normalizeLabel(enrich.subject);
+
     if (!label || label === "other") return { ok: false, reason: "other" };
 
     const category = label === "man" || label === "woman" ? "human" : "animal";
+
     return { ok: true, category, label };
 }
 
 // ======================
-// Subject-only classify (used for free)
+// Subject-only classify (used for free) + cache
 // ======================
-async function classifySubjectOnly(imageDataUrl) {
+async function classifySubjectOnly(imageDataUrl, timings) {
+    const key = subjectCacheKey(imageDataUrl);
+    const cached = subjectCacheGet(key);
+    if (cached) {
+        timings.subject_only_cache_hit = true;
+        return { subject: cached.subject, label: cached.label, cached: true };
+    }
+
     const r = await client.responses.create({
         model: CONFIG.CLASSIFY_MODEL,
         input: [
@@ -480,7 +459,14 @@ async function classifySubjectOnly(imageDataUrl) {
 
     const out = JSON.parse(r.output_text || "{}");
     const label = normalizeLabel(out.subject);
-    return { subject: out.subject, label };
+
+    subjectCacheSet(key, {
+        subject: out.subject,
+        label,
+        expiresAt: Date.now() + CONFIG.SUBJECT_CACHE_TTL_MS,
+    });
+
+    return { subject: out.subject, label, cached: false };
 }
 
 // ======================
@@ -566,22 +552,6 @@ async function sbGetStatus(deviceId) {
     };
 }
 
-async function sbGrantCredits(deviceId, amount) {
-    const { data, error } = await supabase.rpc("grant_pro_credits", {
-        p_device_id: deviceId,
-        p_amount: amount,
-        p_default_seed: CONFIG.DEFAULT_PRO_BALANCE,
-    });
-
-    if (error) throw error;
-    const row = Array.isArray(data) ? data[0] : data;
-    return {
-        proTokens: row.pro_tokens,
-        proUsed: row.pro_used,
-        remainingPro: row.remaining_pro,
-    };
-}
-
 async function sbSpendCredits(deviceId, cost) {
     const { data, error } = await supabase.rpc("spend_pro_credits", {
         p_device_id: deviceId,
@@ -593,6 +563,22 @@ async function sbSpendCredits(deviceId, cost) {
     const row = Array.isArray(data) ? data[0] : data;
     return {
         ok: !!row.ok,
+        proTokens: row.pro_tokens,
+        proUsed: row.pro_used,
+        remainingPro: row.remaining_pro,
+    };
+}
+
+async function sbGrantCredits(deviceId, amount) {
+    const { data, error } = await supabase.rpc("grant_pro_credits", {
+        p_device_id: deviceId,
+        p_amount: amount,
+        p_default_seed: CONFIG.DEFAULT_PRO_BALANCE,
+    });
+
+    if (error) throw error;
+    const row = Array.isArray(data) ? data[0] : data;
+    return {
         proTokens: row.pro_tokens,
         proUsed: row.pro_used,
         remainingPro: row.remaining_pro,
@@ -623,95 +609,140 @@ app.post("/status", async (req, res) => {
     }
 });
 
-// ✅ Unified thought endpoint for your new flow
+// ✅ Unified thought endpoint
 // POST /thought
 // body: { tier: "free"|"pro", imageDataUrl: "data:...base64", deviceId?: string }
 app.post("/thought", async (req, res) => {
     const t0 = Date.now();
-    const times = {};
-    const mark = (k) => (times[k] = Date.now() - t0);
+    const rid = `srv_${crypto.randomBytes(6).toString("hex")}`;
+
+    const timings = { start: 0 };
 
     try {
         const { tier, imageDataUrl } = req.body || {};
         const isPro = tier === "pro";
 
+        const contentLength = String(imageDataUrl || "").length;
+
+        console.log("[THOUGHT] start", { rid, tier, contentLength });
+
         if (!imageDataUrl || typeof imageDataUrl !== "string") {
             return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
         }
-
-        mark("start");
 
         let label = "other";
         let enrich = null;
 
         if (isPro) {
+            const tE = Date.now();
             enrich = await enrichImage(imageDataUrl);
-            mark("enrich_done");
+            timings.enrich_done = Date.now() - t0;
 
             const out = classifyFromEnrich(enrich);
             label = out?.ok ? out.label : "other";
-            mark("classify_from_enrich_done");
-        } else {
-            const subj = await classifySubjectOnly(imageDataUrl);
-            mark("subject_only_done");
 
+            console.log("[THOUGHT] enrich", { rid, ms: Date.now() - tE, label });
+        } else {
+            const tS = Date.now();
+            const subj = await classifySubjectOnly(imageDataUrl, timings);
+            timings.subject_only_done = Date.now() - t0;
             label = subj?.label || "other";
-            mark("label_set");
+
+            console.log("[THOUGHT] subject_only", {
+                rid,
+                ms: Date.now() - tS,
+                label,
+                cached: !!subj?.cached,
+                cacheHit: !!timings.subject_only_cache_hit,
+            });
         }
+
+        timings.label_set = Date.now() - t0;
 
         const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
         if (!isValidLabel(label) || blocked.has(label) || label === "other") {
-            mark("fallback_unknown");
+            timings.done_free = Date.now() - t0;
+            console.log("[THOUGHT] unknown-label", { rid, label, totalMs: Date.now() - t0 });
+
             return res.json({
                 ok: true,
                 thought: "I can’t tell what I’m looking at… but I’m judging it anyway. 👀",
                 tier: isPro ? "pro" : "free",
                 label: "unknown",
                 ms: Date.now() - t0,
-                timings: times,
+                timings,
                 enrich: isPro ? enrich : undefined,
             });
         }
 
+        // FREE path: bank pick
         if (!isPro) {
+            const tB = Date.now();
             let thoughts = await sbGetTodaysBank(label).catch(() => null);
-            mark("bank_fetch_done");
 
             if (!thoughts) {
                 buildBankInBackground(label);
                 thoughts = await ensureDailyBank(label);
-                mark("bank_ensure_done");
             }
+
+            timings.bank_fetch_done = Date.now() - t0;
 
             if (!thoughts?.length) {
-                mark("no_bank");
-                return res.json({ ok: false, error: "NO_BANK_YET", label, ms: Date.now() - t0, timings: times });
+                console.log("[THOUGHT] no_bank_yet", { rid, label, totalMs: Date.now() - t0 });
+                return res.json({ ok: false, error: "NO_BANK_YET", label, ms: Date.now() - t0, timings });
             }
 
-            mark("done_free");
+            timings.done_free = Date.now() - t0;
+
+            console.log("[THOUGHT] free_done", {
+                rid,
+                label,
+                bankMs: Date.now() - tB,
+                totalMs: Date.now() - t0,
+                bankCount: thoughts.length,
+            });
+
             return res.json({
                 ok: true,
                 thought: pick(thoughts),
                 tier: "free",
                 label,
                 ms: Date.now() - t0,
-                timings: times,
+                timings,
                 source: "supabase-bank",
             });
         }
 
+        // PRO path: spend credits then generate
         const deviceId = requireDeviceId(req);
         if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
+        const tSpend = Date.now();
         const spend = await sbSpendCredits(deviceId, 1);
-        mark("spend_done");
+        timings.credits_spend_done = Date.now() - t0;
+
+        console.log("[THOUGHT] spend", {
+            rid,
+            ok: spend.ok,
+            ms: Date.now() - tSpend,
+            remainingPro: spend.remainingPro,
+        });
 
         if (!spend.ok) {
-            return res.json({ ok: false, error: "PRO_LIMIT_REACHED", remainingPro: spend.remainingPro ?? 0, timings: times });
+            return res.json({
+                ok: false,
+                error: "PRO_LIMIT_REACHED",
+                remainingPro: spend.remainingPro ?? 0,
+                ms: Date.now() - t0,
+                timings,
+            });
         }
 
+        const tGen = Date.now();
         const thought = await generateProThought(label, enrich);
-        mark("pro_thought_done");
+        timings.pro_generate_done = Date.now() - t0;
+
+        console.log("[THOUGHT] pro_done", { rid, label, genMs: Date.now() - tGen, totalMs: Date.now() - t0 });
 
         return res.json({
             ok: true,
@@ -721,14 +752,13 @@ app.post("/thought", async (req, res) => {
             enrich,
             remainingPro: spend.remainingPro,
             ms: Date.now() - t0,
-            timings: times,
+            timings,
         });
     } catch (e) {
         console.error("Server error in /thought:", e);
-        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR", ms: Date.now() - t0, timings });
     }
 });
-
 
 app.post("/dev/add-credits", async (req, res) => {
     try {
@@ -758,7 +788,6 @@ const PORT = process.env.PORT || 8787;
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`🔎 DEBUG_THOUGHT=${CONFIG.DEBUG_THOUGHT ? "ON" : "OFF"} (set DEBUG_THOUGHT=1 to enable)`);
 
     if (CONFIG.PREWARM_ON_START) prewarmHotLabels();
 
