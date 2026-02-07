@@ -7,7 +7,7 @@ import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "2mb" })); // ✅ smaller now (no base64 images)
+app.use(express.json({ limit: "5mb" })); // ✅ smaller now that we don't accept images
 
 // ======================
 // 🔧 CONFIG
@@ -31,7 +31,7 @@ const CONFIG = {
     THOUGHT_MODEL: "gpt-4o-mini",
 
     PREWARM_ENABLED: true,
-    PREWARM_LABELS: ["man", "woman", "dog", "cat", "rabbit", "hamster", "fish", "bird", "horse"],
+    PREWARM_LABELS: ["man", "woman", "person", "dog", "cat"],
     PREWARM_ON_START: true,
     PREWARM_CHECK_INTERVAL_MINUTES: 60,
 
@@ -69,7 +69,11 @@ function requireDeviceId(req) {
 // ======================
 const utcDayKey = () => new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
-const cleanLabel = (l) => String(l || "").trim().toLowerCase();
+
+function sanitizeLabel(l) {
+    return String(l || "").toLowerCase().replace(/[^a-z]/g, "").slice(0, 24);
+}
+
 const isValidLabel = (l) => /^[a-z]{2,24}$/.test(l);
 
 const LABEL_ALIASES = {
@@ -83,7 +87,7 @@ const LABEL_ALIASES = {
 };
 
 function normalizeLabel(label) {
-    const l = cleanLabel(label);
+    const l = sanitizeLabel(label);
     return LABEL_ALIASES[l] || l;
 }
 
@@ -155,6 +159,7 @@ function filterWithAutoRelax(text, { minWords, maxWords, labelForLogs = "unknown
 
 // ======================
 // Supabase bank helpers
+// Table: thought_banks(label text, bank_date date, thoughts text[])
 // ======================
 async function sbGetTodaysBank(label) {
     const bankDate = utcDayKey();
@@ -187,13 +192,20 @@ async function sbUpsertBank(label, thoughts) {
 
     const { error } = await supabase
         .from("thought_banks")
-        .upsert({ label, bank_date: bankDate, thoughts: cleanThoughts }, { onConflict: "label,bank_date" });
+        .upsert(
+            {
+                label,
+                bank_date: bankDate,
+                thoughts: cleanThoughts,
+            },
+            { onConflict: "label,bank_date" }
+        );
 
     if (error) throw error;
 }
 
 // ======================
-// Generation (FREE bank)
+// Generation (FREE BANK)
 // ======================
 async function generateThoughtBatch(label, count) {
     const minW = CONFIG.FREE_THOUGHT_MIN_WORDS;
@@ -294,7 +306,6 @@ async function prewarmHotLabels() {
 
     const labels = (CONFIG.PREWARM_LABELS || [])
         .map(normalizeLabel)
-        .map(cleanLabel)
         .filter(isValidLabel);
 
     if (!labels.length) return;
@@ -306,47 +317,41 @@ async function prewarmHotLabels() {
 }
 
 // ======================
-// Pro Thought generation (NO VISION)
+// PRO thought (TEXT-ONLY, uses client enrich)
 // ======================
-function summarizeClientEnrich(enrich) {
-    // expected from app:
-    // { subject: "dog|cat|person|unknown", labels:[{text,confidence}], meta:{faceCount,...}, errors? }
+function safeEnrich(enrich) {
     if (!enrich || typeof enrich !== "object") return null;
 
-    const subject = typeof enrich.subject === "string" ? enrich.subject : null;
-    const faceCount = typeof enrich?.meta?.faceCount === "number" ? enrich.meta.faceCount : null;
-
+    const faceCount = Number(enrich?.meta?.faceCount ?? 0);
     const labels = Array.isArray(enrich.labels)
         ? enrich.labels
+            .slice(0, 8)
             .map((l) => ({
-                text: String(l?.text || "").trim(),
+                text: String(l?.text || "").slice(0, 40),
                 confidence: typeof l?.confidence === "number" ? l.confidence : null,
             }))
             .filter((l) => l.text)
-            .slice(0, 8)
         : [];
 
-    return { subject, faceCount, labels };
+    const labelRaw = typeof enrich.labelRaw === "string" ? enrich.labelRaw.slice(0, 40) : null;
+
+    return { labelRaw, labels, meta: { faceCount: Number.isFinite(faceCount) ? faceCount : 0 } };
 }
 
-async function generateProThought(label, enrichSummary) {
+async function generateProThought(label, enrich) {
     const minW = CONFIG.PRO_THOUGHT_MIN_WORDS;
     const maxW = CONFIG.PRO_THOUGHT_MAX_WORDS;
 
-    const labelSafe = normalizeLabel(label);
-    const ce = enrichSummary || {};
+    const e = safeEnrich(enrich);
 
-    const labelHints =
-        (ce.labels || [])
-            .map((l) => `${l.text}${typeof l.confidence === "number" ? ` (${Math.round(l.confidence * 100)}%)` : ""}`)
-            .join(", ") || "none";
-
-    const faceHint =
-        typeof ce.faceCount === "number"
-            ? ce.faceCount > 0
-                ? "faces detected"
-                : "no faces detected"
-            : "unknown";
+    const hintLines = e
+        ? [
+            `Signals:`,
+            `- faceCount: ${e.meta.faceCount}`,
+            `- topLabelRaw: ${e.labelRaw || "unknown"}`,
+            `- labels: ${(e.labels || []).map((x) => x.text).join(", ") || "none"}`,
+        ].join("\n")
+        : `Signals:\n- none`;
 
     const r = await client.responses.create({
         model: CONFIG.THOUGHT_MODEL,
@@ -364,12 +369,9 @@ async function generateProThought(label, enrichSummary) {
             {
                 role: "user",
                 content:
-                    `You are a ${labelSafe}.\n` +
-                    `On-device clues:\n` +
-                    `- subject guess: ${ce.subject || "unknown"}\n` +
-                    `- ${faceHint}\n` +
-                    `- top labels: ${labelHints}\n\n` +
-                    `Write an inner thought that feels specific to what's happening, not generic.`,
+                    `You are a ${label}.\n` +
+                    `${hintLines}\n` +
+                    `Write an inner thought that feels specific to the detected scene signals (if any).`,
             },
         ],
         max_output_tokens: 160,
@@ -380,7 +382,7 @@ async function generateProThought(label, enrichSummary) {
 }
 
 // ======================
-// Supabase usage helpers
+// Supabase usage helpers (credits)
 // ======================
 async function sbGetStatus(deviceId) {
     const { data: existing, error: selErr } = await supabase
@@ -477,7 +479,7 @@ app.post("/status", async (req, res) => {
 
 app.post("/thought-free", async (req, res) => {
     try {
-        const label = normalizeLabel(req.body.label);
+        const label = normalizeLabel(req.body?.label);
         if (!isValidLabel(label)) return res.json({ ok: false });
 
         let thoughts = await sbGetTodaysBank(label).catch(() => null);
@@ -496,7 +498,7 @@ app.post("/thought-free", async (req, res) => {
         });
     } catch (e) {
         console.error("Server error in /thought-free:", e);
-        res.status(500).json({ ok: false });
+        res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
 
@@ -510,10 +512,6 @@ app.post("/thought-pro", async (req, res) => {
         const label = normalizeLabel(req.body?.label);
         if (!isValidLabel(label)) return res.status(400).json({ ok: false, error: "BAD_LABEL" });
 
-        // enrich is optional but recommended
-        const clientEnrich = req.body?.enrich || null;
-        const enrichSummary = summarizeClientEnrich(clientEnrich);
-
         // 1️⃣ Spend credit first (atomic)
         const spend = await sbSpendCredits(deviceId, 1);
 
@@ -525,21 +523,20 @@ app.post("/thought-pro", async (req, res) => {
             });
         }
 
-        // 2️⃣ Generate thought (no vision)
-        const thought = await generateProThought(label, enrichSummary);
+        // 2️⃣ Generate thought using ONLY text + client enrich
+        const enrich = req.body?.enrich || null;
+        const thought = await generateProThought(label, enrich);
 
         return res.json({
             ok: true,
             thought,
             remainingPro: spend.remainingPro,
             tier: "pro",
-            used: { clientEnrich: !!enrichSummary },
-            debug: { clientEnrich: enrichSummary || null },
         });
     } catch (e) {
         console.error("❌ /thought-pro error:", e);
 
-        // refund safety net
+        // Optional refund safety net
         try {
             const deviceId = requireDeviceId(req);
             if (deviceId) await sbGrantCredits(deviceId, 1);
