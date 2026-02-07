@@ -37,6 +37,10 @@ const CONFIG = {
     PREWARM_CHECK_INTERVAL_MINUTES: 60,
 
     DEFAULT_PRO_BALANCE: Number(process.env.DEFAULT_PRO_BALANCE || 5),
+
+    // 🔎 DEBUG LOGGING
+    // Set DEBUG_THOUGHT=1 in your Render env vars to enable extra logs.
+    DEBUG_THOUGHT: process.env.DEBUG_THOUGHT === "1",
 };
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -154,6 +158,30 @@ function filterWithAutoRelax(text, { minWords, maxWords, labelForLogs = "unknown
     return { lines, mode: "strict-empty" };
 }
 
+// ----------------------
+// Debug helpers
+// ----------------------
+function approxImageKbFromDataUrl(imageDataUrl) {
+    if (typeof imageDataUrl !== "string") return null;
+    const comma = imageDataUrl.indexOf(",");
+    const b64 = comma >= 0 ? imageDataUrl.slice(comma + 1) : imageDataUrl;
+    // base64 bytes ~ (len * 3/4) minus padding
+    const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+    const bytes = Math.max(0, Math.floor((b64.length * 3) / 4) - padding);
+    return Math.round(bytes / 1024);
+}
+
+function shortDevice(id) {
+    if (!id || typeof id !== "string") return null;
+    if (id.length <= 8) return id;
+    return `${id.slice(0, 4)}…${id.slice(-3)}`;
+}
+
+function dbg(...args) {
+    if (!CONFIG.DEBUG_THOUGHT) return;
+    console.log(...args);
+}
+
 // ======================
 // Supabase bank helpers
 // Table: thought_banks(label text, bank_date date, thoughts text[])
@@ -189,10 +217,7 @@ async function sbUpsertBank(label, thoughts) {
 
     const { error } = await supabase
         .from("thought_banks")
-        .upsert(
-            { label, bank_date: bankDate, thoughts: cleanThoughts },
-            { onConflict: "label,bank_date" }
-        );
+        .upsert({ label, bank_date: bankDate, thoughts: cleanThoughts }, { onConflict: "label,bank_date" });
 
     if (error) throw error;
 }
@@ -232,9 +257,7 @@ async function generateThoughtBatch(label, count) {
     });
 
     const text =
-        resp.output_text ||
-        resp.output?.[0]?.content?.find((c) => c.type === "output_text")?.text ||
-        "";
+        resp.output_text || resp.output?.[0]?.content?.find((c) => c.type === "output_text")?.text || "";
 
     const { lines } = filterWithAutoRelax(text, { minWords: minW, maxWords: maxW, labelForLogs: label });
     return lines.map(ensureSingleEndingEmoji);
@@ -291,11 +314,7 @@ async function ensureDailyBank(label) {
 async function prewarmHotLabels() {
     if (!CONFIG.PREWARM_ENABLED) return;
 
-    const labels = (CONFIG.PREWARM_LABELS || [])
-        .map(normalizeLabel)
-        .map(cleanLabel)
-        .filter(isValidLabel);
-
+    const labels = (CONFIG.PREWARM_LABELS || []).map(normalizeLabel).map(cleanLabel).filter(isValidLabel);
     if (!labels.length) return;
 
     for (const label of labels) {
@@ -376,11 +395,9 @@ function classifyFromEnrich(enrich) {
     }
 
     const label = normalizeLabel(enrich.subject);
-
     if (!label || label === "other") return { ok: false, reason: "other" };
 
     const category = label === "man" || label === "woman" ? "human" : "animal";
-
     return { ok: true, category, label };
 }
 
@@ -600,11 +617,26 @@ app.post("/classify", async (req, res) => {
 // body: { tier: "free"|"pro", imageDataUrl: "data:...base64", deviceId?: string }
 app.post("/thought", async (req, res) => {
     const t0 = Date.now();
-    try {
-        const { tier, imageDataUrl } = req.body || {};
-        const isPro = tier === "pro";
 
+    const { tier, imageDataUrl } = req.body || {};
+    const isPro = tier === "pro";
+
+    const imageChars = typeof imageDataUrl === "string" ? imageDataUrl.length : 0;
+    const imageKb = approxImageKbFromDataUrl(imageDataUrl);
+
+    // 🔎 REQUEST LOG (no base64 dump)
+    dbg("🧠 /thought req", {
+        tier,
+        isPro,
+        hasDeviceId: !!req.body?.deviceId,
+        deviceId: shortDevice(req.body?.deviceId),
+        imageChars,
+        approxKb: imageKb,
+    });
+
+    try {
         if (!imageDataUrl || typeof imageDataUrl !== "string") {
+            dbg("❌ /thought bad request (missing imageDataUrl)");
             return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
         }
 
@@ -612,16 +644,47 @@ app.post("/thought", async (req, res) => {
         let enrich = null;
 
         if (isPro) {
+            dbg("🔎 /thought pro: enriching image…");
+            const tEnrich0 = Date.now();
             enrich = await enrichImage(imageDataUrl);
+            const enrichMs = Date.now() - tEnrich0;
+
             const out = classifyFromEnrich(enrich);
             label = out?.ok ? out.label : "other";
+
+            dbg("🧾 /thought pro: enrich result", {
+                label,
+                ms: enrichMs,
+                snapshot: {
+                    subject: enrich?.subject,
+                    action: enrich?.action,
+                    expression: enrich?.expression,
+                    gaze: enrich?.gaze,
+                    pose: enrich?.pose,
+                    setting: enrich?.setting,
+                    propsCount: Array.isArray(enrich?.props) ? enrich.props.length : 0,
+                    vibe: enrich?.vibe,
+                },
+            });
         } else {
+            dbg("🔎 /thought free: subject-only classify…");
+            const tCls0 = Date.now();
             const subj = await classifySubjectOnly(imageDataUrl);
+            const clsMs = Date.now() - tCls0;
+
             label = subj?.label || "other";
+
+            dbg("🧾 /thought free: classify result", {
+                subject: subj?.subject,
+                label,
+                ms: clsMs,
+            });
         }
 
         const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
         if (!isValidLabel(label) || blocked.has(label) || label === "other") {
+            dbg("⚠️ /thought: fallback label", { label });
+
             return res.json({
                 ok: true,
                 thought: "I can’t tell what I’m looking at… but I’m judging it anyway. 👀",
@@ -633,19 +696,32 @@ app.post("/thought", async (req, res) => {
         }
 
         if (!isPro) {
+            dbg("📚 /thought free: fetching bank", { label });
+
             let thoughts = await sbGetTodaysBank(label).catch(() => null);
             if (!thoughts) {
+                dbg("📚 /thought free: bank missing, building…", { label });
                 buildBankInBackground(label);
                 thoughts = await ensureDailyBank(label);
             }
 
             if (!thoughts?.length) {
+                dbg("❌ /thought free: NO_BANK_YET", { label, ms: Date.now() - t0 });
                 return res.json({ ok: false, error: "NO_BANK_YET", label, ms: Date.now() - t0 });
             }
 
+            const chosen = pick(thoughts);
+
+            dbg("✅ /thought free: ok", {
+                label,
+                ms: Date.now() - t0,
+                bankSize: thoughts.length,
+                thoughtPreview: typeof chosen === "string" ? chosen.slice(0, 48) : null,
+            });
+
             return res.json({
                 ok: true,
-                thought: pick(thoughts),
+                thought: chosen,
                 tier: "free",
                 label,
                 ms: Date.now() - t0,
@@ -653,10 +729,21 @@ app.post("/thought", async (req, res) => {
             });
         }
 
+        // PRO path
         const deviceId = requireDeviceId(req);
-        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+        if (!deviceId) {
+            dbg("❌ /thought pro: missing deviceId");
+            return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+        }
 
+        dbg("💳 /thought pro: spending credit", { deviceId: shortDevice(deviceId) });
         const spend = await sbSpendCredits(deviceId, 1);
+
+        dbg("💳 /thought pro: spend result", {
+            ok: spend?.ok,
+            remainingPro: spend?.remainingPro,
+        });
+
         if (!spend.ok) {
             return res.json({
                 ok: false,
@@ -665,7 +752,18 @@ app.post("/thought", async (req, res) => {
             });
         }
 
+        dbg("✍️ /thought pro: generating thought", { label });
+        const tGen0 = Date.now();
         const thought = await generateProThought(label, enrich);
+        const genMs = Date.now() - tGen0;
+
+        dbg("✅ /thought pro: ok", {
+            label,
+            ms: Date.now() - t0,
+            genMs,
+            remainingPro: spend.remainingPro,
+            thoughtPreview: typeof thought === "string" ? thought.slice(0, 64) : null,
+        });
 
         return res.json({
             ok: true,
@@ -678,6 +776,18 @@ app.post("/thought", async (req, res) => {
         });
     } catch (e) {
         console.error("Server error in /thought:", e);
+
+        // Optional refund safety net on failures AFTER spending:
+        try {
+            if (isPro) {
+                const deviceId = requireDeviceId(req);
+                if (deviceId) {
+                    dbg("↩️ /thought pro: refunding 1 credit due to error", { deviceId: shortDevice(deviceId) });
+                    await sbGrantCredits(deviceId, 1);
+                }
+            }
+        } catch {}
+
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
@@ -710,6 +820,7 @@ const PORT = process.env.PORT || 8787;
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
+    console.log(`🔎 DEBUG_THOUGHT=${CONFIG.DEBUG_THOUGHT ? "ON" : "OFF"} (set DEBUG_THOUGHT=1 to enable)`);
 
     if (CONFIG.PREWARM_ON_START) prewarmHotLabels();
 
