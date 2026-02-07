@@ -69,6 +69,15 @@ function requireDeviceId(req) {
     return trimmed;
 }
 
+function withTimeout(promise, ms, label = "timeout") {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`${label} after ${ms}ms`)), ms)
+        ),
+    ]);
+}
+
 // ======================
 // Helpers
 // ======================
@@ -582,188 +591,95 @@ app.post("/status", async (req, res) => {
     }
 });
 
-// Keep /classify for backwards compatibility
-app.post("/classify", async (req, res) => {
-    const t0 = Date.now();
-    try {
-        const { imageDataUrl } = req.body;
-        const len = (imageDataUrl || "").length;
-        console.log("🖼️ /classify bytes", len);
-
-        if (!imageDataUrl || typeof imageDataUrl !== "string") {
-            return res.status(400).json({ ok: false, reason: "BAD_REQUEST" });
-        }
-
-        console.log("⏳ classify via enrich");
-        const enrich = await enrichImage(imageDataUrl);
-
-        const out = classifyFromEnrich(enrich);
-        if (!out.ok) return res.json({ ...out, ms: Date.now() - t0, enrich });
-
-        const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
-        if (!isValidLabel(out.label) || blocked.has(out.label)) {
-            return res.json({ ok: false, reason: "invalid_label", ms: Date.now() - t0, enrich });
-        }
-
-        return res.json({ ...out, ms: Date.now() - t0, enrich });
-    } catch (e) {
-        console.error("Server error in /classify:", e);
-        return res.status(500).json({ ok: false, reason: "SERVER_ERROR", ms: Date.now() - t0 });
-    }
-});
-
 // ✅ Unified thought endpoint for your new flow
 // POST /thought
 // body: { tier: "free"|"pro", imageDataUrl: "data:...base64", deviceId?: string }
 app.post("/thought", async (req, res) => {
     const t0 = Date.now();
-
-    const { tier, imageDataUrl } = req.body || {};
-    const isPro = tier === "pro";
-
-    const imageChars = typeof imageDataUrl === "string" ? imageDataUrl.length : 0;
-    const imageKb = approxImageKbFromDataUrl(imageDataUrl);
-
-    // 🔎 REQUEST LOG (no base64 dump)
-    dbg("🧠 /thought req", {
-        tier,
-        isPro,
-        hasDeviceId: !!req.body?.deviceId,
-        deviceId: shortDevice(req.body?.deviceId),
-        imageChars,
-        approxKb: imageKb,
-    });
+    const times = {};
+    const mark = (k) => (times[k] = Date.now() - t0);
 
     try {
+        const { tier, imageDataUrl } = req.body || {};
+        const isPro = tier === "pro";
+
         if (!imageDataUrl || typeof imageDataUrl !== "string") {
-            dbg("❌ /thought bad request (missing imageDataUrl)");
             return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
         }
+
+        mark("start");
 
         let label = "other";
         let enrich = null;
 
         if (isPro) {
-            dbg("🔎 /thought pro: enriching image…");
-            const tEnrich0 = Date.now();
             enrich = await enrichImage(imageDataUrl);
-            const enrichMs = Date.now() - tEnrich0;
+            mark("enrich_done");
 
             const out = classifyFromEnrich(enrich);
             label = out?.ok ? out.label : "other";
-
-            dbg("🧾 /thought pro: enrich result", {
-                label,
-                ms: enrichMs,
-                snapshot: {
-                    subject: enrich?.subject,
-                    action: enrich?.action,
-                    expression: enrich?.expression,
-                    gaze: enrich?.gaze,
-                    pose: enrich?.pose,
-                    setting: enrich?.setting,
-                    propsCount: Array.isArray(enrich?.props) ? enrich.props.length : 0,
-                    vibe: enrich?.vibe,
-                },
-            });
+            mark("classify_from_enrich_done");
         } else {
-            dbg("🔎 /thought free: subject-only classify…");
-            const tCls0 = Date.now();
             const subj = await classifySubjectOnly(imageDataUrl);
-            const clsMs = Date.now() - tCls0;
+            mark("subject_only_done");
 
             label = subj?.label || "other";
-
-            dbg("🧾 /thought free: classify result", {
-                subject: subj?.subject,
-                label,
-                ms: clsMs,
-            });
+            mark("label_set");
         }
 
         const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
         if (!isValidLabel(label) || blocked.has(label) || label === "other") {
-            dbg("⚠️ /thought: fallback label", { label });
-
+            mark("fallback_unknown");
             return res.json({
                 ok: true,
                 thought: "I can’t tell what I’m looking at… but I’m judging it anyway. 👀",
                 tier: isPro ? "pro" : "free",
                 label: "unknown",
                 ms: Date.now() - t0,
+                timings: times,
                 enrich: isPro ? enrich : undefined,
             });
         }
 
         if (!isPro) {
-            dbg("📚 /thought free: fetching bank", { label });
-
             let thoughts = await sbGetTodaysBank(label).catch(() => null);
+            mark("bank_fetch_done");
+
             if (!thoughts) {
-                dbg("📚 /thought free: bank missing, building…", { label });
                 buildBankInBackground(label);
                 thoughts = await ensureDailyBank(label);
+                mark("bank_ensure_done");
             }
 
             if (!thoughts?.length) {
-                dbg("❌ /thought free: NO_BANK_YET", { label, ms: Date.now() - t0 });
-                return res.json({ ok: false, error: "NO_BANK_YET", label, ms: Date.now() - t0 });
+                mark("no_bank");
+                return res.json({ ok: false, error: "NO_BANK_YET", label, ms: Date.now() - t0, timings: times });
             }
 
-            const chosen = pick(thoughts);
-
-            dbg("✅ /thought free: ok", {
-                label,
-                ms: Date.now() - t0,
-                bankSize: thoughts.length,
-                thoughtPreview: typeof chosen === "string" ? chosen.slice(0, 48) : null,
-            });
-
+            mark("done_free");
             return res.json({
                 ok: true,
-                thought: chosen,
+                thought: pick(thoughts),
                 tier: "free",
                 label,
                 ms: Date.now() - t0,
+                timings: times,
                 source: "supabase-bank",
             });
         }
 
-        // PRO path
         const deviceId = requireDeviceId(req);
-        if (!deviceId) {
-            dbg("❌ /thought pro: missing deviceId");
-            return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
-        }
+        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
-        dbg("💳 /thought pro: spending credit", { deviceId: shortDevice(deviceId) });
         const spend = await sbSpendCredits(deviceId, 1);
-
-        dbg("💳 /thought pro: spend result", {
-            ok: spend?.ok,
-            remainingPro: spend?.remainingPro,
-        });
+        mark("spend_done");
 
         if (!spend.ok) {
-            return res.json({
-                ok: false,
-                error: "PRO_LIMIT_REACHED",
-                remainingPro: spend.remainingPro ?? 0,
-            });
+            return res.json({ ok: false, error: "PRO_LIMIT_REACHED", remainingPro: spend.remainingPro ?? 0, timings: times });
         }
 
-        dbg("✍️ /thought pro: generating thought", { label });
-        const tGen0 = Date.now();
         const thought = await generateProThought(label, enrich);
-        const genMs = Date.now() - tGen0;
-
-        dbg("✅ /thought pro: ok", {
-            label,
-            ms: Date.now() - t0,
-            genMs,
-            remainingPro: spend.remainingPro,
-            thoughtPreview: typeof thought === "string" ? thought.slice(0, 64) : null,
-        });
+        mark("pro_thought_done");
 
         return res.json({
             ok: true,
@@ -773,24 +689,14 @@ app.post("/thought", async (req, res) => {
             enrich,
             remainingPro: spend.remainingPro,
             ms: Date.now() - t0,
+            timings: times,
         });
     } catch (e) {
         console.error("Server error in /thought:", e);
-
-        // Optional refund safety net on failures AFTER spending:
-        try {
-            if (isPro) {
-                const deviceId = requireDeviceId(req);
-                if (deviceId) {
-                    dbg("↩️ /thought pro: refunding 1 credit due to error", { deviceId: shortDevice(deviceId) });
-                    await sbGrantCredits(deviceId, 1);
-                }
-            }
-        } catch {}
-
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
+
 
 app.post("/dev/add-credits", async (req, res) => {
     try {
