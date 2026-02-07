@@ -9,6 +9,38 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
 
+app.use((req, res, next) => {
+    const rid = req.headers["x-req-id"] || `srv_${Math.random().toString(16).slice(2)}`;
+    const clientSentAt = Number(req.headers["x-client-sent-at"] || 0);
+    const serverReceivedAt = Date.now();
+
+    req._rid = String(rid);
+    req._serverReceivedAt = serverReceivedAt;
+    req._clientSentAt = clientSentAt;
+
+    res.setHeader("x-req-id", req._rid);
+    res.setHeader("x-server-received-at", String(serverReceivedAt));
+
+    console.log(`[WIRE] recv ${req.method} ${req.path}`, {
+        rid: req._rid,
+        clientSentAt: clientSentAt || null,
+        serverReceivedAt,
+        deltaClientToServerMs: clientSentAt ? serverReceivedAt - clientSentAt : null,
+        contentLength: req.headers["content-length"] || null,
+    });
+
+    res.on("finish", () => {
+        console.log(`[WIRE] done ${req.method} ${req.path}`, {
+            rid: req._rid,
+            status: res.statusCode,
+            serverTotalMs: Date.now() - serverReceivedAt,
+        });
+    });
+
+    next();
+});
+
+
 // ======================
 // 🔧 CONFIG
 // ======================
