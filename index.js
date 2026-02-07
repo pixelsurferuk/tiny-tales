@@ -28,7 +28,8 @@ const CONFIG = {
     RELAX_2_DELTA_MIN_WORDS: 3,
     RELAX_2_DELTA_MAX_WORDS: 8,
 
-    CLASSIFY_MODEL: "gpt-4o-mini",
+    // Used only if you want server-side fallback enrichment from image
+    VISION_MODEL: "gpt-4o-mini",
     THOUGHT_MODEL: "gpt-4o-mini",
 
     PREWARM_ENABLED: true,
@@ -68,7 +69,7 @@ function requireDeviceId(req) {
 // ======================
 // Helpers
 // ======================
-const utcDayKey = () => new Date().toISOString().slice(0, 10);
+const utcDayKey = () => new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const cleanLabel = (l) => String(l || "").trim().toLowerCase();
 const isValidLabel = (l) => /^[a-z]{2,24}$/.test(l);
@@ -198,7 +199,7 @@ async function sbUpsertBank(label, thoughts) {
 }
 
 // ======================
-// Generation (Free bank)
+// Generation (FREE bank)
 // ======================
 async function generateThoughtBatch(label, count) {
     const minW = CONFIG.FREE_THOUGHT_MIN_WORDS;
@@ -236,7 +237,12 @@ async function generateThoughtBatch(label, count) {
         resp.output?.[0]?.content?.find((c) => c.type === "output_text")?.text ||
         "";
 
-    const { lines } = filterWithAutoRelax(text, { minWords: minW, maxWords: maxW, labelForLogs: label });
+    const { lines } = filterWithAutoRelax(text, {
+        minWords: minW,
+        maxWords: maxW,
+        labelForLogs: label,
+    });
+
     return lines.map(ensureSingleEndingEmoji);
 }
 
@@ -247,9 +253,10 @@ const bankBuildLocks = new Set();
 
 async function buildBankInBackground(label) {
     if (!label || !isValidLabel(label)) return;
-    if (bankBuildLocks.has(label)) return;
 
+    if (bankBuildLocks.has(label)) return;
     bankBuildLocks.add(label);
+
     try {
         const existing = await sbGetTodaysBank(label).catch(() => null);
         if (existing?.length) return;
@@ -305,17 +312,18 @@ async function prewarmHotLabels() {
 }
 
 // ======================
-// 🧠 ENRICHMENT (used for classify + pro)
+// 🧠 Optional server-side vision fallback (PRO)
+// Only used if client doesn't send enrich and DOES send imageDataUrl.
 // ======================
-async function enrichImage(imageDataUrl) {
+async function enrichImageFromVision(imageDataUrl) {
     const r = await client.responses.create({
-        model: CONFIG.CLASSIFY_MODEL,
+        model: CONFIG.VISION_MODEL,
         input: [
             {
                 role: "system",
                 content:
                     "You are a visual analyst for a family-friendly humour app. " +
-                    "Return JSON only. Be concise. If unsure, pick the best guess.",
+                    "Return concise JSON only. If unsure, pick the best guess.",
             },
             {
                 role: "user",
@@ -323,74 +331,74 @@ async function enrichImage(imageDataUrl) {
                     {
                         type: "input_text",
                         text:
-                            "Analyse the subject and their behaviour. Return JSON with:\n" +
+                            "Analyse the subject and what's happening. Return JSON with:\n" +
                             "{\n" +
-                            '  "subject": "dog|cat|man|woman|other",\n' +
                             '  "action": "sleeping|yawning|chewing|staring|playing|posing|walking|eating|begging|other",\n' +
                             '  "expression": "happy|sleepy|suspicious|annoyed|excited|guilty|confused|neutral|other",\n' +
                             '  "gaze": "at_camera|away|side_eye|up|down|unknown",\n' +
                             '  "pose": "lying|sitting|standing|curled|sprawled|unknown",\n' +
                             '  "setting": ["indoors|outdoors", "sofa|bed|car|garden|office|street|other"],\n' +
                             '  "props": ["toy","food","leash","phone","laptop","bowl","blanket","shoe","none"],\n' +
-                            '  "extra_tags": ["short", "descriptive", "words"],\n' +
                             '  "vibe": "2-5 words"\n' +
                             "}\n" +
-                            "Rules: keep arrays short (max 6). No sentences.",
+                            "Rules: keep arrays short. No sentences.",
                     },
                     { type: "input_image", image_url: imageDataUrl, detail: "high" },
                 ],
             },
         ],
-        text: {
-            format: {
-                type: "json_schema",
-                strict: true,
-                name: "enrichment",
-                schema: {
-                    type: "object",
-                    additionalProperties: false,
-                    properties: {
-                        subject: { type: "string" },
-                        action: { type: "string" },
-                        expression: { type: "string" },
-                        gaze: { type: "string" },
-                        pose: { type: "string" },
-                        setting: { type: "array", items: { type: "string" }, maxItems: 2 },
-                        props: { type: "array", items: { type: "string" }, maxItems: 6 },
-                        extra_tags: { type: "array", items: { type: "string" }, maxItems: 6 },
-                        vibe: { type: "string" },
-                    },
-                    required: ["subject", "action", "expression", "gaze", "pose", "setting", "props", "extra_tags", "vibe"],
-                },
-            },
-        },
         max_output_tokens: 220,
     });
 
-    return JSON.parse(r.output_text || "{}");
-}
-
-// ✅ FIXED: matches enrichImage schema (subject is a STRING)
-function classifyFromEnrich(enrich) {
-    if (!enrich || typeof enrich.subject !== "string") {
-        return { ok: false, reason: "no_subject" };
+    const raw = (r.output_text || "").trim();
+    try {
+        return JSON.parse(raw || "{}");
+    } catch {
+        return {};
     }
-
-    const label = normalizeLabel(enrich.subject);
-
-    if (!label || label === "other") return { ok: false, reason: "other" };
-
-    const category = (label === "man" || label === "woman") ? "human" : "animal";
-
-    return { ok: true, category, label };
 }
 
-// ======================
-// Pro thought generator
-// ======================
-async function generateProThought(label, enrich) {
+function summarizeClientEnrich(enrich) {
+    // Expected shape from app now:
+    // { subject: "dog|cat|person|unknown", labels: [{text,confidence}], meta: {faceCount,...}, errors? }
+    if (!enrich || typeof enrich !== "object") return null;
+
+    const subject = typeof enrich.subject === "string" ? enrich.subject : null;
+    const faceCount = typeof enrich?.meta?.faceCount === "number" ? enrich.meta.faceCount : null;
+
+    const labels = Array.isArray(enrich.labels)
+        ? enrich.labels
+            .map((l) => ({
+                text: String(l?.text || "").trim(),
+                confidence: typeof l?.confidence === "number" ? l.confidence : null,
+            }))
+            .filter((l) => l.text)
+            .slice(0, 8)
+        : [];
+
+    return { subject, faceCount, labels };
+}
+
+async function generateProThought(label, clientEnrichSummary, visionFallbackEnrich) {
     const minW = CONFIG.PRO_THOUGHT_MIN_WORDS;
     const maxW = CONFIG.PRO_THOUGHT_MAX_WORDS;
+
+    const labelSafe = normalizeLabel(label);
+
+    const ce = clientEnrichSummary || {};
+    const ve = visionFallbackEnrich || {};
+
+    const labelHints =
+        (ce.labels || [])
+            .map((l) => `${l.text}${typeof l.confidence === "number" ? ` (${Math.round(l.confidence * 100)}%)` : ""}`)
+            .join(", ") || "none";
+
+    const faceHint =
+        typeof ce.faceCount === "number"
+            ? ce.faceCount > 0
+                ? "faces detected"
+                : "no faces detected"
+            : "unknown";
 
     const r = await client.responses.create({
         model: CONFIG.THOUGHT_MODEL,
@@ -408,18 +416,20 @@ async function generateProThought(label, enrich) {
             {
                 role: "user",
                 content:
-                    `You are a ${label}.\n` +
-                    `Behaviour:\n` +
-                    `- action: ${enrich.action}\n` +
-                    `- expression: ${enrich.expression}\n` +
-                    `- gaze: ${enrich.gaze}\n` +
-                    `- pose: ${enrich.pose}\n` +
-                    `Scene:\n` +
-                    `- setting: ${(enrich.setting || []).join(", ")}\n` +
-                    `- props: ${(enrich.props || []).join(", ")}\n` +
-                    `- extra: ${(enrich.extra_tags || []).join(", ")}\n` +
-                    `- vibe: ${enrich.vibe}\n` +
-                    `Write an inner thought that clearly reflects the action + expression + gaze (not just the room).`,
+                    `You are a ${labelSafe}.\n` +
+                    `On-device hints (from phone ML):\n` +
+                    `- subject guess: ${ce.subject || "unknown"}\n` +
+                    `- ${faceHint}\n` +
+                    `- top labels: ${labelHints}\n\n` +
+                    `Optional vision fallback (if available):\n` +
+                    `- action: ${ve.action || "unknown"}\n` +
+                    `- expression: ${ve.expression || "unknown"}\n` +
+                    `- gaze: ${ve.gaze || "unknown"}\n` +
+                    `- pose: ${ve.pose || "unknown"}\n` +
+                    `- setting: ${Array.isArray(ve.setting) ? ve.setting.join(", ") : "unknown"}\n` +
+                    `- props: ${Array.isArray(ve.props) ? ve.props.join(", ") : "unknown"}\n` +
+                    `- vibe: ${ve.vibe || "unknown"}\n\n` +
+                    `Write an inner thought that matches what's happening (action/expression if present), not just the room.`,
             },
         ],
         max_output_tokens: 160,
@@ -525,91 +535,6 @@ app.post("/status", async (req, res) => {
     }
 });
 
-app.post("/classify", async (req, res) => {
-    const t0 = Date.now();
-    try {
-        const { imageDataUrl } = req.body;
-        const len = (imageDataUrl || "").length;
-        console.log("🖼️ /classify bytes", len);
-
-        if (!imageDataUrl || typeof imageDataUrl !== "string") {
-            return res.status(400).json({ ok: false, reason: "BAD_REQUEST" });
-        }
-
-        console.log("⏳ classify via enrich");
-        const enrich = await enrichImage(imageDataUrl);
-
-        const out = classifyFromEnrich(enrich);
-        if (!out.ok) return res.json({ ...out, ms: Date.now() - t0, enrich });
-
-        // Safety validation
-        const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
-        if (!isValidLabel(out.label) || blocked.has(out.label)) {
-            return res.json({ ok: false, reason: "invalid_label", ms: Date.now() - t0, enrich });
-        }
-
-        return res.json({ ...out, ms: Date.now() - t0, enrich });
-    } catch (e) {
-        console.error("Server error in /classify:", e);
-        return res.status(500).json({ ok: false, reason: "SERVER_ERROR", ms: Date.now() - t0 });
-    }
-});
-
-app.post("/thought-pro", async (req, res) => {
-    console.log("🧠 /thought-pro start");
-
-    try {
-        const deviceId = requireDeviceId(req);
-        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
-        console.log("✔ deviceId", deviceId);
-
-        const { label, imageDataUrl } = req.body;
-        if (!label || !imageDataUrl) return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
-        console.log("✔ label", label, "image?", !!imageDataUrl);
-
-        // 1) Spend credit first (atomic)
-        console.log("⏳ spend credits");
-        const spend = await sbSpendCredits(deviceId, 1);
-        console.log("✔ spend result", spend);
-
-        if (!spend.ok) {
-            return res.json({
-                ok: false,
-                error: "PRO_LIMIT_REACHED",
-                remainingPro: spend.remainingPro ?? 0,
-            });
-        }
-
-        // 2) Enrich image (behaviour + expression)
-        console.log("⏳ enrich image");
-        const enrich = await enrichImage(imageDataUrl);
-        console.log("✔ enrich", enrich);
-
-        // 3) Generate personality-driven thought
-        console.log("⏳ generate thought");
-        const thought = await generateProThought(normalizeLabel(label), enrich);
-        console.log("✔ thought ok");
-
-        return res.json({
-            ok: true,
-            thought,
-            enrich,
-            remainingPro: spend.remainingPro,
-            tier: "pro",
-        });
-    } catch (e) {
-        console.error("❌ /thought-pro error:", e);
-
-        // Optional refund safety net
-        try {
-            const deviceId = requireDeviceId(req);
-            if (deviceId) await sbGrantCredits(deviceId, 1);
-        } catch {}
-
-        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
-    }
-});
-
 app.post("/thought-free", async (req, res) => {
     try {
         const label = normalizeLabel(req.body.label);
@@ -632,6 +557,71 @@ app.post("/thought-free", async (req, res) => {
     } catch (e) {
         console.error("Server error in /thought-free:", e);
         res.status(500).json({ ok: false });
+    }
+});
+
+app.post("/thought-pro", async (req, res) => {
+    console.log("🧠 /thought-pro start");
+
+    try {
+        const deviceId = requireDeviceId(req);
+        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+
+        const label = normalizeLabel(req.body?.label);
+        if (!isValidLabel(label)) return res.status(400).json({ ok: false, error: "BAD_LABEL" });
+
+        const clientEnrich = req.body?.enrich || null;
+        const imageDataUrl = req.body?.imageDataUrl || null;
+
+        // 1️⃣ Spend credit first (atomic)
+        const spend = await sbSpendCredits(deviceId, 1);
+
+        if (!spend.ok) {
+            return res.json({
+                ok: false,
+                error: "PRO_LIMIT_REACHED",
+                remainingPro: spend.remainingPro ?? 0,
+            });
+        }
+
+        // 2️⃣ Build enrich context
+        const clientSummary = summarizeClientEnrich(clientEnrich);
+
+        // Optional: only do expensive vision if client didn't give enrich
+        // (You can flip this logic if you want both.)
+        let visionEnrich = null;
+        if (!clientSummary && typeof imageDataUrl === "string" && imageDataUrl.length > 50) {
+            console.log("👁️ no client enrich, running vision fallback...");
+            visionEnrich = await enrichImageFromVision(imageDataUrl);
+        }
+
+        // 3️⃣ Generate thought
+        const thought = await generateProThought(label, clientSummary, visionEnrich);
+
+        return res.json({
+            ok: true,
+            thought,
+            remainingPro: spend.remainingPro,
+            tier: "pro",
+            used: {
+                clientEnrich: !!clientSummary,
+                visionFallback: !!visionEnrich,
+            },
+            debug: {
+                clientEnrich: clientSummary || null,
+                visionEnrich: visionEnrich || null,
+            },
+        });
+    } catch (e) {
+        console.error("❌ /thought-pro error:", e);
+
+        // Optional refund safety net
+        try {
+            const deviceId = requireDeviceId(req);
+            if (deviceId) await sbGrantCredits(deviceId, 1);
+        } catch {}
+
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
 
