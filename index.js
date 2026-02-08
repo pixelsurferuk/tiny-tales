@@ -180,7 +180,6 @@ function subjectCacheGet(key) {
 }
 
 function subjectCacheSet(key, value) {
-    // basic cap
     if (subjectCache.size >= CONFIG.SUBJECT_CACHE_MAX) {
         // delete one (oldest-ish: Map preserves insertion order)
         const firstKey = subjectCache.keys().next().value;
@@ -193,14 +192,40 @@ function subjectCacheSet(key, value) {
 // Supabase bank helpers
 // Table: thought_banks(label text, bank_date date, thoughts text[])
 // ======================
-async function sbGetTodaysBank(label) {
-    const bankDate = utcDayKey();
 
+// Returns bank for specific date key
+async function sbGetBankByDate(label, bankDate) {
     const { data, error } = await supabase
         .from("thought_banks")
-        .select("thoughts")
+        .select("thoughts, bank_date")
         .eq("label", label)
         .eq("bank_date", bankDate)
+        .maybeSingle();
+
+    if (error) throw error;
+
+    const thoughts = data?.thoughts;
+    if (!Array.isArray(thoughts) || thoughts.length === 0) return null;
+
+    return thoughts
+        .filter((t) => typeof t === "string")
+        .map((t) => t.trim())
+        .filter(Boolean);
+}
+
+// ✅ wrapper so existing code still works
+async function sbGetTodaysBank(label) {
+    return sbGetBankByDate(label, utcDayKey());
+}
+
+// ✅ Returns most recent bank (any date)
+async function sbGetLatestBank(label) {
+    const { data, error } = await supabase
+        .from("thought_banks")
+        .select("thoughts, bank_date")
+        .eq("label", label)
+        .order("bank_date", { ascending: false })
+        .limit(1)
         .maybeSingle();
 
     if (error) throw error;
@@ -313,11 +338,23 @@ async function buildBankInBackground(label) {
 }
 
 async function ensureDailyBank(label) {
-    const existing = await sbGetTodaysBank(label).catch(() => null);
-    if (existing?.length) return existing;
+    const today = utcDayKey();
 
-    await buildBankInBackground(label);
-    return (await sbGetTodaysBank(label).catch(() => null)) || [];
+    // 1) Try today's bank
+    const todays = await sbGetBankByDate(label, today).catch(() => null);
+    if (todays?.length) return { thoughts: todays, source: "today" };
+
+    // 2) Fallback to latest available (yesterday etc.)
+    const latest = await sbGetLatestBank(label).catch(() => null);
+    if (latest?.length) {
+        // Build today's in background but don't block user
+        buildBankInBackground(label);
+        return { thoughts: latest, source: "latest-fallback" };
+    }
+
+    // 3) Nothing exists anywhere -> kick off build and return empty
+    buildBankInBackground(label);
+    return { thoughts: [], source: "none" };
 }
 
 async function prewarmHotLabels() {
@@ -345,7 +382,9 @@ async function enrichImage(imageDataUrl) {
         input: [
             {
                 role: "system",
-                content: "You are a visual analyst for a family-friendly humour app. Return JSON only. Be concise. If unsure, pick the best guess.",
+                content:
+                    "You are a visual analyst for a family-friendly humour app. " +
+                    "Return JSON only. Be concise. If unsure, pick the best guess.",
             },
             {
                 role: "user",
@@ -675,21 +714,35 @@ app.post("/thought", async (req, res) => {
             });
         }
 
-        // FREE path: bank pick
+        // FREE path: bank pick (single return, logs always fire)
         if (!isPro) {
             const tB = Date.now();
-            let thoughts = await sbGetTodaysBank(label).catch(() => null);
 
-            if (!thoughts) {
-                buildBankInBackground(label);
-                thoughts = await ensureDailyBank(label);
-            }
+            const bank = await ensureDailyBank(label);
+            const thoughts = bank.thoughts;
 
             timings.bank_fetch_done = Date.now() - t0;
 
             if (!thoughts?.length) {
-                console.log("[THOUGHT] no_bank_yet", { rid, label, totalMs: Date.now() - t0 });
-                return res.json({ ok: false, error: "NO_BANK_YET", label, ms: Date.now() - t0, timings });
+                timings.done_free = Date.now() - t0;
+
+                console.log("[THOUGHT] no_bank_anywhere", {
+                    rid,
+                    label,
+                    bankSource: bank.source,
+                    bankMs: Date.now() - tB,
+                    totalMs: Date.now() - t0,
+                });
+
+                return res.json({
+                    ok: true,
+                    thought: "I can’t tell what I’m looking at… but I’m judging it anyway. 👀",
+                    tier: "free",
+                    label: "unknown",
+                    ms: Date.now() - t0,
+                    timings,
+                    source: "fallback-no-bank",
+                });
             }
 
             timings.done_free = Date.now() - t0;
@@ -697,6 +750,7 @@ app.post("/thought", async (req, res) => {
             console.log("[THOUGHT] free_done", {
                 rid,
                 label,
+                bankSource: bank.source, // today | latest-fallback | none
                 bankMs: Date.now() - tB,
                 totalMs: Date.now() - t0,
                 bankCount: thoughts.length,
@@ -709,7 +763,7 @@ app.post("/thought", async (req, res) => {
                 label,
                 ms: Date.now() - t0,
                 timings,
-                source: "supabase-bank",
+                source: `supabase-bank:${bank.source}`,
             });
         }
 
