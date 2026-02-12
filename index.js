@@ -70,6 +70,18 @@ function requireDeviceId(req) {
     return trimmed;
 }
 
+function jwtRole(key) {
+    try {
+        const payload = key.split(".")[1];
+        const json = Buffer.from(payload, "base64").toString("utf8");
+        return JSON.parse(json).role || JSON.parse(json).aud;
+    } catch {
+        return "unreadable";
+    }
+}
+
+console.log("SUPABASE key role:", jwtRole(process.env.SUPABASE_SERVICE_ROLE_KEY || ""));
+
 // ======================
 // Helpers
 // ======================
