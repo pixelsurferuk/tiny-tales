@@ -482,7 +482,7 @@ async function classifySubjectOnly(imageDataUrl, timings) {
             {
                 role: "system",
                 content:
-                    "Return JSON only. Identify the main subject as ONE of: man, woman, dog, cat, horse, bird, rabbit, hamster, fish, other. Best guess if unsure.",
+                    "Return JSON only. Identify the single main subject in the image as either man, woman, or a pet; if it matches one of the following pets return that exact value: dog, cat, horse, bird, rabbit, hamster, fish, guinea pig, turtle, tortoise, parrot, ferret, hedgehog, chinchilla, gecko, snake, lizard, pig, goat, sheep, cow, chicken, duck, goose, donkey, pony, alpaca, llama, deer, fox, wolf, raccoon, squirrel, rat, mouse, gerbil, frog, toad, axolotl, crab, shrimp, goldfish, budgie, canary, cockatiel, pigeon, swan, peacock; if it is clearly a pet but not in this list return the most specific single-word animal name; if none clearly match return other; use lowercase only and return exactly one value with no additional text.",
             },
             {
                 role: "user",
