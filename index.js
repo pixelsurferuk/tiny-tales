@@ -850,6 +850,49 @@ app.post("/dev/add-credits", async (req, res) => {
     }
 });
 
+// POST /classify
+// body: { imageDataUrl: "data:...base64" }
+// returns: { ok: true, label: "dog", subject: "dog", cached: true/false }
+app.post("/classify", async (req, res) => {
+    const t0 = Date.now();
+    const timings = {};
+
+    try {
+        const { imageDataUrl } = req.body || {};
+        const contentLength = String(imageDataUrl || "").length;
+
+        if (!imageDataUrl || typeof imageDataUrl !== "string") {
+            return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
+        }
+
+        console.log("[CLASSIFY] start", { contentLength });
+
+        // Use your existing fast subject-only classifier (+ cache)
+        const subj = await classifySubjectOnly(imageDataUrl, timings);
+        const label = subj?.label || "other";
+        const subject = subj?.subject || "other";
+
+        // Normalize “other” and blocked values to unknown for pet profiles
+        const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
+        const finalLabel =
+            !isValidLabel(label) || blocked.has(label) || label === "other"
+                ? "unknown"
+                : label;
+
+        return res.json({
+            ok: true,
+            label: finalLabel,
+            subject,
+            cached: !!subj?.cached,
+            ms: Date.now() - t0,
+            timings,
+        });
+    } catch (e) {
+        console.error("Server error in /classify:", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR", ms: Date.now() - t0 });
+    }
+});
+
 const PORT = process.env.PORT || 8787;
 
 app.listen(PORT, () => {
