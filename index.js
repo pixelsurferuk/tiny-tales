@@ -24,6 +24,10 @@ const CONFIG = {
     PRO_THOUGHT_MIN_WORDS: 10,
     PRO_THOUGHT_MAX_WORDS: 35,
 
+    // Ask-a-question replies (short + punchy)
+    ASK_MIN_WORDS: 6,
+    ASK_MAX_WORDS: 22,
+
     RELAX_1_DELTA_MIN_WORDS: 2,
     RELAX_1_DELTA_MAX_WORDS: 4,
     RELAX_2_DELTA_MIN_WORDS: 3,
@@ -565,6 +569,45 @@ async function generateProThought(label, enrich) {
 }
 
 // ======================
+// Ask-a-question generator
+// ======================
+async function generateAskAnswer({ label, pet, question }) {
+    const minW = CONFIG.ASK_MIN_WORDS;
+    const maxW = CONFIG.ASK_MAX_WORDS;
+
+    const petName = String(pet?.name || "my pet").trim() || "my pet";
+    const vibe = String(pet?.vibe || "").trim();
+
+    const r = await client.responses.create({
+        model: CONFIG.THOUGHT_MODEL,
+        input: [
+            {
+                role: "system",
+                content:
+                    `You are ${petName}, a ${label}. ` +
+                    "Reply to the human's question in first person (I/me/my). " +
+                    "Make it funny, lightly judgemental, and family friendly. " +
+                    "No profanity/hate/sexual content. " +
+                    "Do not mention photos/camera/app. " +
+                    `Length: ${minW}-${maxW} words. ` +
+                    "End with exactly ONE fitting emoji at the very end.",
+            },
+            {
+                role: "user",
+                content:
+                    (vibe ? `Personality notes (how you talk): ${vibe}\n` : "") +
+                    `Question: ${String(question || "").trim()}\n` +
+                    "Answer the question directly as the pet.",
+            },
+        ],
+        max_output_tokens: 160,
+    });
+
+    const out = stripLinePrefix((r.output_text || "").trim());
+    return ensureSingleEndingEmoji(out);
+}
+
+// ======================
 // Supabase usage helpers
 // ======================
 async function sbGetStatus(deviceId) {
@@ -657,6 +700,66 @@ app.post("/status", async (req, res) => {
     } catch (e) {
         console.error("Server error in /status:", e);
         res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    }
+});
+
+// Chat-style ask endpoint (question → pet answer)
+app.post("/ask", async (req, res) => {
+    const t0 = Date.now();
+    const rid = `srv_${crypto.randomBytes(6).toString("hex")}`;
+    const timings = { start: 0 };
+
+    try {
+        const { imageDataUrl, question, pet } = req.body || {};
+        const hintLabelRaw = req.body?.hintLabel;
+        const hintLabel = typeof hintLabelRaw === "string" ? normalizeLabel(hintLabelRaw) : null;
+
+        const q = String(question || "").trim();
+        if (!q) return res.status(400).json({ ok: false, error: "MISSING_QUESTION" });
+
+        if (!imageDataUrl || typeof imageDataUrl !== "string") {
+            return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
+        }
+
+        let label = "other";
+
+        // Similar to FREE thought: allow a safe hint label to skip classify.
+        const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
+        if (hintLabel && isValidLabel(hintLabel) && !blocked.has(hintLabel) && hintLabel !== "other") {
+            label = hintLabel;
+            timings.used_hint_label = true;
+        } else {
+            const subj = await classifySubjectOnly(imageDataUrl, timings);
+            label = subj?.label || "other";
+            timings.subject_only_done = Date.now() - t0;
+        }
+
+        if (!isValidLabel(label) || blocked.has(label) || label === "other") {
+            return res.json({
+                ok: true,
+                answer: "I can’t tell what I’m looking at… so I’ll just assume you’re wrong. 👀",
+                label: "unknown",
+                ms: Date.now() - t0,
+                timings,
+            });
+        }
+
+        const tGen = Date.now();
+        const answer = await generateAskAnswer({ label, pet, question: q });
+        timings.gen_done = Date.now() - t0;
+
+        console.log("[ASK] done", { rid, label, genMs: Date.now() - tGen, totalMs: Date.now() - t0 });
+
+        return res.json({
+            ok: true,
+            answer,
+            label,
+            ms: Date.now() - t0,
+            timings,
+        });
+    } catch (e) {
+        console.error("Server error in /ask:", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
 
