@@ -672,6 +672,8 @@ app.post("/thought", async (req, res) => {
     try {
         const { tier, imageDataUrl } = req.body || {};
         const isPro = tier === "pro";
+        const hintLabelRaw = req.body?.hintLabel;
+        const hintLabel = typeof hintLabelRaw === "string" ? normalizeLabel(hintLabelRaw) : null;
 
         const contentLength = String(imageDataUrl || "").length;
 
@@ -694,18 +696,28 @@ app.post("/thought", async (req, res) => {
 
             console.log("[THOUGHT] enrich", { rid, ms: Date.now() - tE, label });
         } else {
-            const tS = Date.now();
-            const subj = await classifySubjectOnly(imageDataUrl, timings);
-            timings.subject_only_done = Date.now() - t0;
-            label = subj?.label || "other";
+            // ✅ If client provides a good hint label (e.g. from pet profile), skip classify for FREE
+            const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
 
-            console.log("[THOUGHT] subject_only", {
-                rid,
-                ms: Date.now() - tS,
-                label,
-                cached: !!subj?.cached,
-                cacheHit: !!timings.subject_only_cache_hit,
-            });
+            if (hintLabel && isValidLabel(hintLabel) && !blocked.has(hintLabel) && hintLabel !== "other") {
+                label = hintLabel;
+                timings.used_hint_label = true;
+
+                console.log("[THOUGHT] used_hint_label", { rid, label });
+            } else {
+                const tS = Date.now();
+                const subj = await classifySubjectOnly(imageDataUrl, timings);
+                timings.subject_only_done = Date.now() - t0;
+                label = subj?.label || "other";
+
+                console.log("[THOUGHT] subject_only", {
+                    rid,
+                    ms: Date.now() - tS,
+                    label,
+                    cached: !!subj?.cached,
+                    cacheHit: !!timings.subject_only_cache_hit,
+                });
+            }
         }
 
         timings.label_set = Date.now() - t0;
