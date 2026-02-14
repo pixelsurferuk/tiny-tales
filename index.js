@@ -46,6 +46,10 @@ const CONFIG = {
     // ✅ Subject-only cache (free)
     SUBJECT_CACHE_TTL_MS: 10 * 60 * 1000, // 10 minutes
     SUBJECT_CACHE_MAX: 2000,
+
+    // ✅ Ask chat memory
+    ASK_HISTORY_MAX: 10,
+    ASK_HISTORY_MAX_CHARS: 420,
 };
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -569,14 +573,33 @@ async function generateProThought(label, enrich) {
 }
 
 // ======================
-// Ask-a-question generator
+// Ask-a-question generator (with chat history)
 // ======================
-async function generateAskAnswer({ label, pet, question }) {
+function sanitizeAskHistory(history) {
+    if (!Array.isArray(history)) return [];
+    return history
+        .slice(-CONFIG.ASK_HISTORY_MAX)
+        .filter(
+            (m) =>
+                m &&
+                (m.role === "user" || m.role === "assistant") &&
+                typeof m.content === "string" &&
+                m.content.trim().length > 0
+        )
+        .map((m) => ({
+            role: m.role,
+            content: String(m.content).trim().slice(0, CONFIG.ASK_HISTORY_MAX_CHARS),
+        }));
+}
+
+async function generateAskAnswer({ label, pet, question, history = [] }) {
     const minW = CONFIG.ASK_MIN_WORDS;
     const maxW = CONFIG.ASK_MAX_WORDS;
 
     const petName = String(pet?.name || "my pet").trim() || "my pet";
     const vibe = String(pet?.vibe || "").trim();
+
+    const safeHistory = sanitizeAskHistory(history);
 
     const r = await client.responses.create({
         model: CONFIG.THOUGHT_MODEL,
@@ -585,22 +608,36 @@ async function generateAskAnswer({ label, pet, question }) {
                 role: "system",
                 content:
                     `You are ${petName}, a ${label}. ` +
-                    "Reply to the human's question in first person (I/me/my). " +
-                    "Make it funny, lightly judgemental, and family friendly. " +
-                    "No profanity/hate/sexual content. " +
-                    "Do not mention photos/camera/app. " +
+                    "IMPORTANT: Write like a real person texting, not a company or assistant. " +
+                    "Never mention AI, prompts, policies, Tiny Tales, apps, photos, cameras, or being a pet. " +
+                    "Reply in first person (I/me/my). Short, chatty, natural. " +
+                    "Sometimes be a bit needy/demanding like a texter (ask for water/snacks/blanket, open the door, etc.). " +
+                    "Sometimes ask a follow-up question. " +
+                    "Family friendly: no profanity/hate/sexual content. " +
                     `Length: ${minW}-${maxW} words. ` +
                     "End with exactly ONE fitting emoji at the very end.",
             },
+
+            // optional personality notes
+            ...(vibe
+                ? [
+                    {
+                        role: "system",
+                        content: `Personality notes (how you talk): ${vibe}`,
+                    },
+                ]
+                : []),
+
+            // ✅ conversation memory (user/assistant)
+            ...safeHistory,
+
+            // current question
             {
                 role: "user",
-                content:
-                    (vibe ? `Personality notes (how you talk): ${vibe}\n` : "") +
-                    `Question: ${String(question || "").trim()}\n` +
-                    "Answer the question directly as the pet.",
+                content: `Question: ${String(question || "").trim()}\nAnswer directly like a text message.`,
             },
         ],
-        max_output_tokens: 160,
+        max_output_tokens: 180,
     });
 
     const out = stripLinePrefix((r.output_text || "").trim());
@@ -703,14 +740,14 @@ app.post("/status", async (req, res) => {
     }
 });
 
-// Chat-style ask endpoint (question → pet answer)
+// Chat-style ask endpoint (question → pet answer) + memory
 app.post("/ask", async (req, res) => {
     const t0 = Date.now();
     const rid = `srv_${crypto.randomBytes(6).toString("hex")}`;
     const timings = { start: 0 };
 
     try {
-        const { imageDataUrl, question, pet } = req.body || {};
+        const { imageDataUrl, question, pet, history } = req.body || {};
         const hintLabelRaw = req.body?.hintLabel;
         const hintLabel = typeof hintLabelRaw === "string" ? normalizeLabel(hintLabelRaw) : null;
 
@@ -720,6 +757,10 @@ app.post("/ask", async (req, res) => {
         if (!imageDataUrl || typeof imageDataUrl !== "string") {
             return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
         }
+
+        // ✅ sanitize history (last N, only user/assistant, strings)
+        const safeHistory = sanitizeAskHistory(history);
+        timings.history_count = safeHistory.length;
 
         let label = "other";
 
@@ -745,10 +786,10 @@ app.post("/ask", async (req, res) => {
         }
 
         const tGen = Date.now();
-        const answer = await generateAskAnswer({ label, pet, question: q });
+        const answer = await generateAskAnswer({ label, pet, question: q, history: safeHistory });
         timings.gen_done = Date.now() - t0;
 
-        console.log("[ASK] done", { rid, label, genMs: Date.now() - tGen, totalMs: Date.now() - t0 });
+        console.log("[ASK] done", { rid, label, genMs: Date.now() - tGen, totalMs: Date.now() - t0, history: safeHistory.length });
 
         return res.json({
             ok: true,
