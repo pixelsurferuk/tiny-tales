@@ -1148,6 +1148,46 @@ app.post("/classify", async (req, res) => {
     }
 });
 
+if (process.env.NODE_ENV !== "development") {
+    app.post("/dev/set-free-chat", (req, res) =>
+        res.status(403).json({ error: "DEV endpoint disabled in production" })
+    );
+}
+app.post("/dev/set-free-chat", async (req, res) => {
+    const { deviceId, remaining } = req.body;
+
+    if (!deviceId) {
+        return res.status(400).json({ ok: false, error: "Missing deviceId" });
+    }
+
+    if (remaining !== 0 && remaining !== 10) {
+        return res.status(400).json({ ok: false, error: "Remaining must be 0 or 10" });
+    }
+
+    try {
+        const { error } = await supabase
+            .from("device_status")
+            .update({
+                remainingFreeChat: remaining,
+                freeChatUsed: remaining === 10 ? 0 : 10,
+            })
+            .eq("deviceId", deviceId);
+
+        if (error) throw error;
+
+        return res.json({
+            ok: true,
+            remainingFreeChat: remaining,
+        });
+    } catch (err) {
+        return res.status(500).json({
+            ok: false,
+            error: err.message,
+        });
+    }
+});
+
+
 const PORT = process.env.PORT || 8787;
 
 app.listen(PORT, () => {
