@@ -50,6 +50,7 @@ const CONFIG = {
     // ✅ Ask chat memory
     ASK_HISTORY_MAX: 10,
     ASK_HISTORY_MAX_CHARS: 420,
+    FREE_CHAT_TOKENS: Number(process.env.FREE_CHAT_TOKENS || 10),
 };
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -212,6 +213,64 @@ function subjectCacheSet(key, value) {
 // Supabase bank helpers
 // Table: thought_banks(label text, bank_date date, thoughts text[])
 // ======================
+
+async function sbGetChatStatus(deviceId) {
+    const { data, error } = await supabase
+        .from("device_usage")
+        .select("device_id, free_chat_tokens, free_chat_used")
+        .eq("device_id", deviceId)
+        .maybeSingle();
+
+    if (error) throw error;
+
+    // Create row if missing (seed both pro + free chat columns safely)
+    if (!data) {
+        const { data: ins, error: insErr } = await supabase
+            .from("device_usage")
+            .insert({
+                device_id: deviceId,
+                pro_tokens: CONFIG.DEFAULT_PRO_BALANCE,
+                pro_used: 0,
+                free_chat_tokens: CONFIG.FREE_CHAT_TOKENS,
+                free_chat_used: 0,
+            })
+            .select("device_id, free_chat_tokens, free_chat_used")
+            .single();
+
+        if (insErr) throw insErr;
+
+        return {
+            freeChatTokens: ins.free_chat_tokens,
+            freeChatUsed: ins.free_chat_used,
+            remainingFreeChat: Math.max(0, ins.free_chat_tokens - ins.free_chat_used),
+        };
+    }
+
+    return {
+        freeChatTokens: data.free_chat_tokens ?? CONFIG.FREE_CHAT_TOKENS,
+        freeChatUsed: data.free_chat_used ?? 0,
+        remainingFreeChat: Math.max(0, (data.free_chat_tokens ?? CONFIG.FREE_CHAT_TOKENS) - (data.free_chat_used ?? 0)),
+    };
+}
+
+async function sbConsumeFreeChat(deviceId) {
+    const { data, error } = await supabase.rpc("consume_free_chat", {
+        p_device_id: deviceId,
+        p_default_seed: CONFIG.FREE_CHAT_TOKENS,
+    });
+
+    if (error) throw error;
+
+    const row = Array.isArray(data) ? data[0] : data;
+
+    return {
+        ok: !!row.ok,
+        freeChatTokens: row.free_chat_tokens,
+        freeChatUsed: row.free_chat_used,
+        remainingFreeChat: row.remaining_free_chat,
+    };
+}
+
 
 // Returns bank for specific date key
 async function sbGetBankByDate(label, bankDate) {
@@ -727,11 +786,19 @@ app.post("/status", async (req, res) => {
         if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
         const s = await sbGetStatus(deviceId);
+        const c = await sbGetChatStatus(deviceId);
+
         return res.json({
             ok: true,
             remainingPro: s.remainingPro,
             proTokens: s.proTokens,
             proUsed: s.proUsed,
+
+            // ✅ Free chat
+            remainingFreeChat: c.remainingFreeChat,
+            freeChatTokens: c.freeChatTokens,
+            freeChatUsed: c.freeChatUsed,
+
             source: "supabase",
         });
     } catch (e) {
@@ -740,6 +807,7 @@ app.post("/status", async (req, res) => {
     }
 });
 
+
 // Chat-style ask endpoint (question → pet answer) + memory
 app.post("/ask", async (req, res) => {
     const t0 = Date.now();
@@ -747,6 +815,27 @@ app.post("/ask", async (req, res) => {
     const timings = { start: 0 };
 
     try {
+
+        const deviceId = requireDeviceId(req);
+        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+
+        // TODO: later: if subscription active -> skip this gate
+        const gate = await sbConsumeFreeChat(deviceId);
+        timings.free_chat_gate = gate;
+
+        if (!gate.ok) {
+            return res.status(402).json({
+                ok: false,
+                error: "FREE_CHAT_LIMIT_REACHED",
+                freeChatTokens: gate.freeChatTokens,
+                freeChatUsed: gate.freeChatUsed,
+                remainingFreeChat: gate.remainingFreeChat,
+                requiresSubscription: true,
+                ms: Date.now() - t0,
+                timings,
+            });
+        }
+
         const { imageDataUrl, question, pet, history } = req.body || {};
         const hintLabelRaw = req.body?.hintLabel;
         const hintLabel = typeof hintLabelRaw === "string" ? normalizeLabel(hintLabelRaw) : null;
