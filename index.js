@@ -819,21 +819,30 @@ app.post("/ask", async (req, res) => {
         const deviceId = requireDeviceId(req);
         if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
-        // TODO: later: if subscription active -> skip this gate
-        const gate = await sbConsumeFreeChat(deviceId);
-        timings.free_chat_gate = gate;
+        const { tier } = req.body || {};
+        const isPro = tier === "pro";
 
-        if (!gate.ok) {
-            return res.status(402).json({
-                ok: false,
-                error: "FREE_CHAT_LIMIT_REACHED",
-                freeChatTokens: gate.freeChatTokens,
-                freeChatUsed: gate.freeChatUsed,
-                remainingFreeChat: gate.remainingFreeChat,
-                requiresSubscription: true,
-                ms: Date.now() - t0,
-                timings,
-            });
+// ✅ Pro is unlimited: skip free-chat gate + do not consume
+        let gate = null;
+
+        if (!isPro) {
+            gate = await sbConsumeFreeChat(deviceId);
+            timings.free_chat_gate = gate;
+
+            if (!gate.ok) {
+                return res.status(402).json({
+                    ok: false,
+                    error: "FREE_CHAT_LIMIT_REACHED",
+                    freeChatTokens: gate.freeChatTokens,
+                    freeChatUsed: gate.freeChatUsed,
+                    remainingFreeChat: gate.remainingFreeChat,
+                    requiresSubscription: true,
+                    ms: Date.now() - t0,
+                    timings,
+                });
+            }
+        } else {
+            timings.free_chat_gate = "skipped:pro";
         }
 
         const { imageDataUrl, question, pet, history } = req.body || {};
@@ -883,10 +892,11 @@ app.post("/ask", async (req, res) => {
         return res.json({
             ok: true,
             answer,
-            label,
+            tier: isPro ? "pro" : "free",   // 👈 add this line
             ms: Date.now() - t0,
             timings,
         });
+
     } catch (e) {
         console.error("Server error in /ask:", e);
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
