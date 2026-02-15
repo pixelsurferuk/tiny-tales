@@ -25,8 +25,8 @@ const CONFIG = {
     PRO_THOUGHT_MAX_WORDS: 35,
 
     // Ask-a-question replies (short + punchy)
-    ASK_MIN_WORDS: 6,
-    ASK_MAX_WORDS: 22,
+    ASK_MIN_WORDS: 10,
+    ASK_MAX_WORDS: 35,
 
     RELAX_1_DELTA_MIN_WORDS: 2,
     RELAX_1_DELTA_MAX_WORDS: 4,
@@ -667,14 +667,14 @@ async function generateAskAnswer({ label, pet, question, history = [] }) {
                 role: "system",
                 content:
                     `You are ${petName}, a ${label}. ` +
-                    "IMPORTANT: Write like a real person texting, not a company or assistant. " +
+                    `IMPORTANT: Write like a ${label} texting, not a company or assistant. ` +
                     "Never mention AI, prompts, policies, Tiny Tales, apps, photos, cameras, or being a pet. " +
                     "Reply in first person (I/me/my). Short, chatty, natural. " +
-                    "Sometimes be a bit needy/demanding like a texter (ask for water/snacks/blanket, open the door, etc.). " +
+                    `Sometimes be a bit needy/demanding like a ${label} (ask for water/snacks/blanket, open the door, etc.). ` +
                     "Sometimes ask a follow-up question. " +
                     "Family friendly: no profanity/hate/sexual content. " +
                     `Length: ${minW}-${maxW} words. ` +
-                    "End with exactly ONE fitting emoji at the very end.",
+                    "Sometimes end with exactly ONE fitting emoji at the very end.",
             },
 
             // optional personality notes
