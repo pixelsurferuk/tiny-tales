@@ -1148,12 +1148,15 @@ app.post("/classify", async (req, res) => {
     }
 });
 
-if (process.env.NODE_ENV !== "development") {
-    app.post("/dev/set-free-chat", (req, res) =>
-        res.status(403).json({ error: "DEV endpoint disabled in production" })
-    );
-}
+const DEV_ADMIN_KEY = process.env.DEV_ADMIN_KEY;
+
 app.post("/dev/set-free-chat", async (req, res) => {
+    const key = req.headers["x-dev-admin-key"];
+
+    if (!DEV_ADMIN_KEY || key !== DEV_ADMIN_KEY) {
+        return res.status(403).json({ error: "Forbidden" });
+    }
+
     const { deviceId, remaining } = req.body;
 
     if (!deviceId) {
