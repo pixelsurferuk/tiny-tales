@@ -8,6 +8,9 @@ import crypto from "crypto";
 
 const app = express();
 app.use(cors());
+
+// Keep JSON for normal endpoints.
+// RevenueCat webhooks are JSON too; we’ll auth them via header token (simplest + robust).
 app.use(express.json({ limit: "20mb" }));
 
 // ======================
@@ -53,6 +56,15 @@ const CONFIG = {
 
     // ✅ Free chat tokens (kept!)
     FREE_CHAT_TOKENS: Number(process.env.FREE_CHAT_TOKENS || 10),
+
+    // RevenueCat entitlement id (your dashboard: Entitlements -> Identifier)
+    RC_ENTITLEMENT_ID: process.env.RC_ENTITLEMENT_ID || "pro_access",
+
+    // RevenueCat webhook auth token (set this in RC dashboard webhook config + server env)
+    RC_WEBHOOK_AUTH: process.env.RC_WEBHOOK_AUTH || "",
+
+    // Cache RC subscriber lookup briefly to reduce API calls
+    RC_CACHE_TTL_MS: 60 * 1000,
 };
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -92,12 +104,11 @@ function jwtRole(key) {
 console.log("SUPABASE key role:", jwtRole(process.env.SUPABASE_SERVICE_ROLE_KEY || ""));
 
 // ======================
-// RevenueCat server-side validation (NEW)
+// RevenueCat server-side validation
 // ======================
 const REVENUECAT_SECRET_KEY = process.env.REVENUECAT_SECRET_KEY;
-// Small cache to avoid calling RevenueCat every request per device
-const rcCache = new Map(); // deviceId -> { isPro, expiresAtMs }
-const RC_CACHE_TTL_MS = 60 * 1000; // 60 seconds
+const rcCache = new Map(); // appUserID -> { isPro, expiresAtMs }
+const RC_CACHE_TTL_MS = CONFIG.RC_CACHE_TTL_MS;
 
 async function validateProWithRevenueCat(appUserID) {
     if (!REVENUECAT_SECRET_KEY) return false;
@@ -116,18 +127,18 @@ async function validateProWithRevenueCat(appUserID) {
         });
 
         if (!r.ok) {
+            // short negative cache to avoid hammering RC if key misconfigured etc.
             rcCache.set(appUserID, { isPro: false, expiresAtMs: Date.now() + 15_000 });
             return false;
         }
 
         const data = await r.json();
-        const ent = data?.subscriber?.entitlements?.pro_access;
+        const ent = data?.subscriber?.entitlements?.[CONFIG.RC_ENTITLEMENT_ID];
 
         let isPro = false;
         if (ent) {
-            // RevenueCat provides expires_date (string) for active entitlements
             if (!ent.expires_date) {
-                // Some configs may omit expires_date for non-expiring; treat as active
+                // non-expiring entitlement
                 isPro = true;
             } else {
                 const exp = Date.parse(ent.expires_date);
@@ -138,7 +149,7 @@ async function validateProWithRevenueCat(appUserID) {
         rcCache.set(appUserID, { isPro, expiresAtMs: Date.now() + RC_CACHE_TTL_MS });
         return isPro;
     } catch (e) {
-        // If RC is down, fail closed for Pro (safer for monetisation)
+        // Fail closed for pro (safer for monetisation)
         rcCache.set(appUserID, { isPro: false, expiresAtMs: Date.now() + 15_000 });
         return false;
     }
@@ -264,12 +275,7 @@ function subjectCacheSet(key, value) {
 // Supabase device usage row (keeps free chat + pro credits)
 // ======================
 async function sbEnsureDeviceRow(deviceId) {
-    const { data, error } = await supabase
-        .from("device_usage")
-        .select("device_id")
-        .eq("device_id", deviceId)
-        .maybeSingle();
-
+    const { data, error } = await supabase.from("device_usage").select("device_id").eq("device_id", deviceId).maybeSingle();
     if (error) throw error;
     if (data) return true;
 
@@ -277,7 +283,6 @@ async function sbEnsureDeviceRow(deviceId) {
         device_id: deviceId,
         pro_tokens: CONFIG.DEFAULT_PRO_BALANCE,
         pro_used: 0,
-
         free_chat_tokens: CONFIG.FREE_CHAT_TOKENS,
         free_chat_used: 0,
     });
@@ -303,10 +308,7 @@ async function sbGetChatStatus(deviceId) {
     return {
         freeChatTokens: data?.free_chat_tokens ?? CONFIG.FREE_CHAT_TOKENS,
         freeChatUsed: data?.free_chat_used ?? 0,
-        remainingFreeChat: Math.max(
-            0,
-            (data?.free_chat_tokens ?? CONFIG.FREE_CHAT_TOKENS) - (data?.free_chat_used ?? 0)
-        ),
+        remainingFreeChat: Math.max(0, (data?.free_chat_tokens ?? CONFIG.FREE_CHAT_TOKENS) - (data?.free_chat_used ?? 0)),
     };
 }
 
@@ -489,7 +491,6 @@ async function prewarmHotLabels() {
     if (!CONFIG.PREWARM_ENABLED) return;
 
     const labels = (CONFIG.PREWARM_LABELS || []).map(normalizeLabel).map(cleanLabel).filter(isValidLabel);
-
     if (!labels.length) return;
 
     for (const label of labels) {
@@ -733,7 +734,6 @@ Family friendly only.
 Length: ${minW}-${maxW} words.
 Sometimes end with exactly ONE fitting emoji.`,
             },
-
             ...(vibe
                 ? [
                     {
@@ -742,9 +742,7 @@ Sometimes end with exactly ONE fitting emoji.`,
                     },
                 ]
                 : []),
-
             ...safeHistory,
-
             {
                 role: "user",
                 content: `Question: ${String(question || "").trim()}\nAnswer directly like a text message.`,
@@ -758,7 +756,7 @@ Sometimes end with exactly ONE fitting emoji.`,
 }
 
 // ======================
-// Supabase pro credits helpers (UNCHANGED)
+// Supabase pro credits helpers
 // ======================
 async function sbGetStatus(deviceId) {
     await sbEnsureDeviceRow(deviceId);
@@ -812,11 +810,45 @@ async function sbGrantCredits(deviceId, amount) {
 }
 
 // ======================
+// RevenueCat credits mapping + dedupe
+// ======================
+const PRODUCT_CREDITS = {
+    "10_smart_thoughts": 10,
+    "25_smart_thoughts": 25,
+    "50_smart_thoughts": 50,
+    "100_smart_thoughts": 100,
+};
+
+// Inserts event id into a dedupe table; returns true if new, false if already processed
+async function rcDedupe(eventId, appUserId, productId) {
+    if (!eventId) return true; // if RC ever omits, fail open but log in webhook handler
+
+    const { data, error } = await supabase
+        .from("revenuecat_events")
+        .insert({
+            event_id: eventId,
+            app_user_id: appUserId || null,
+            product_id: productId || null,
+        })
+        .select("event_id")
+        .maybeSingle();
+
+    if (!error) return true;
+
+    // unique violation = already processed
+    const msg = String(error.message || "");
+    if (msg.toLowerCase().includes("duplicate") || msg.toLowerCase().includes("unique")) return false;
+
+    // unknown error: be safe and block double-grant
+    throw error;
+}
+
+// ======================
 // Routes
 // ======================
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// NEW: status now uses RevenueCat for isPro, but keeps free chat + pro credits
+// status uses RevenueCat for isPro, keeps free chat + pro credits
 app.post("/status", async (req, res) => {
     try {
         const deviceId = requireDeviceId(req);
@@ -829,7 +861,6 @@ app.post("/status", async (req, res) => {
 
         return res.json({
             ok: true,
-
             remainingPro: s.remainingPro,
             proTokens: s.proTokens,
             proUsed: s.proUsed,
@@ -947,7 +978,7 @@ app.post("/ask", async (req, res) => {
     }
 });
 
-// ✅ Unified thought endpoint (UNCHANGED logic: still uses tier passed by client)
+// ✅ Unified thought endpoint (your original behaviour kept: tier still client-driven)
 app.post("/thought", async (req, res) => {
     const t0 = Date.now();
     const rid = `srv_${crypto.randomBytes(6).toString("hex")}`;
@@ -1118,38 +1149,6 @@ app.post("/thought", async (req, res) => {
     }
 });
 
-// ✅ NEW: one-time product grants pro thought credits (maps to your existing RPC)
-const PRODUCT_CREDITS = {
-    "10_smart_thoughts": 10,
-    "25_smart_thoughts": 25,
-    "50_smart_thoughts": 50,
-    "100_smart_thoughts": 100,
-};
-
-app.post("/credits/grant", async (req, res) => {
-    try {
-        const deviceId = requireDeviceId(req);
-        const productId = String(req.body?.productId || "").trim();
-
-        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
-        const amount = PRODUCT_CREDITS[productId];
-        if (!amount) return res.status(400).json({ ok: false, error: "UNKNOWN_PRODUCT" });
-
-        const r = await sbGrantCredits(deviceId, amount);
-
-        return res.json({
-            ok: true,
-            remainingPro: r.remainingPro,
-            proTokens: r.proTokens,
-            proUsed: r.proUsed,
-            source: "revenuecat+supabase",
-        });
-    } catch (e) {
-        console.error("credits grant error", e);
-        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
-    }
-});
-
 // POST /classify
 app.post("/classify", async (req, res) => {
     const t0 = Date.now();
@@ -1186,9 +1185,69 @@ app.post("/classify", async (req, res) => {
     }
 });
 
-// ✅ Keep your dev endpoint
+// ======================
+// ✅ RevenueCat Webhook (SECURE credit grants)
+// ======================
+app.post("/revenuecat/webhook", async (req, res) => {
+    try {
+        // Simple auth: set RC webhook to send: Authorization: Bearer <RC_WEBHOOK_AUTH>
+        if (!CONFIG.RC_WEBHOOK_AUTH) {
+            return res.status(500).json({ ok: false, error: "WEBHOOK_AUTH_NOT_CONFIGURED" });
+        }
+
+        const auth = String(req.headers.authorization || "");
+        if (auth !== `Bearer ${CONFIG.RC_WEBHOOK_AUTH}`) {
+            return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+        }
+
+        const event = req.body || {};
+        const eventId = event?.event?.id || event?.event?.event_id || event?.id || null;
+
+        // RevenueCat usually provides app_user_id
+        const appUserId = event?.event?.app_user_id || event?.app_user_id || null;
+
+        // Product id can be under product_id / store_product_id depending on payload
+        const productId =
+            event?.event?.product_id ||
+            event?.event?.store_product_id ||
+            event?.product_id ||
+            event?.store_product_id ||
+            null;
+
+        // Type: "NON_SUBSCRIPTION_PURCHASE", "INITIAL_PURCHASE", etc
+        const type = event?.event?.type || event?.type || "";
+
+        // Only care about our credit packs here
+        const credits = productId ? PRODUCT_CREDITS[String(productId).trim()] : null;
+
+        // A webhook can fire multiple times, so dedupe before granting
+        if (credits && appUserId) {
+            const isNew = await rcDedupe(String(eventId || crypto.randomUUID()), String(appUserId), String(productId));
+            if (!isNew) {
+                return res.json({ ok: true, deduped: true });
+            }
+
+            const granted = await sbGrantCredits(String(appUserId), credits);
+
+            console.log("[RC WEBHOOK] credits granted", { type, appUserId, productId, credits });
+            return res.json({ ok: true, granted });
+        }
+
+        // If it’s not a credit product, we still return ok (webhook should not retry forever)
+        console.log("[RC WEBHOOK] ignored", { type, appUserId, productId });
+        return res.json({ ok: true, ignored: true });
+    } catch (e) {
+        console.error("RevenueCat webhook error:", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    }
+});
+
+// ======================
+// DEV-only endpoint (optional)
+// ======================
 const DEV_ADMIN_KEY = process.env.DEV_ADMIN_KEY;
 
+// Keep your dev endpoint
 app.post("/dev/set-free-chat", async (req, res) => {
     try {
         const key = req.headers["x-dev-admin-key"];
@@ -1228,6 +1287,29 @@ app.post("/dev/set-free-chat", async (req, res) => {
         });
     } catch (e) {
         console.error("dev set free chat error", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    }
+});
+
+// Optional: lock down old insecure /credits/grant (DEV ONLY)
+app.post("/credits/grant", async (req, res) => {
+    try {
+        const key = req.headers["x-dev-admin-key"];
+        if (!DEV_ADMIN_KEY || key !== DEV_ADMIN_KEY) {
+            return res.status(403).json({ ok: false, error: "FORBIDDEN" });
+        }
+
+        const deviceId = requireDeviceId(req);
+        const productId = String(req.body?.productId || "").trim();
+        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+
+        const amount = PRODUCT_CREDITS[productId];
+        if (!amount) return res.status(400).json({ ok: false, error: "UNKNOWN_PRODUCT" });
+
+        const r = await sbGrantCredits(deviceId, amount);
+        return res.json({ ok: true, ...r, source: "dev-only" });
+    } catch (e) {
+        console.error("credits grant error", e);
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
