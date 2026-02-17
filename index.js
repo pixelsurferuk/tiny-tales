@@ -50,6 +50,8 @@ const CONFIG = {
     // ✅ Ask chat memory
     ASK_HISTORY_MAX: 10,
     ASK_HISTORY_MAX_CHARS: 420,
+
+    // ✅ Free chat tokens (kept!)
     FREE_CHAT_TOKENS: Number(process.env.FREE_CHAT_TOKENS || 10),
 };
 
@@ -65,11 +67,9 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     console.warn("⚠️ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY. Supabase endpoints will fail.");
 }
 
-const supabase = createClient(
-    SUPABASE_URL || "http://invalid",
-    SUPABASE_SERVICE_ROLE_KEY || "invalid",
-    { auth: { persistSession: false } }
-);
+const supabase = createClient(SUPABASE_URL || "http://invalid", SUPABASE_SERVICE_ROLE_KEY || "invalid", {
+    auth: { persistSession: false },
+});
 
 function requireDeviceId(req) {
     const id = req.body?.deviceId;
@@ -90,6 +90,59 @@ function jwtRole(key) {
 }
 
 console.log("SUPABASE key role:", jwtRole(process.env.SUPABASE_SERVICE_ROLE_KEY || ""));
+
+// ======================
+// RevenueCat server-side validation (NEW)
+// ======================
+const REVENUECAT_SECRET_KEY = process.env.REVENUECAT_SECRET_KEY;
+// Small cache to avoid calling RevenueCat every request per device
+const rcCache = new Map(); // deviceId -> { isPro, expiresAtMs }
+const RC_CACHE_TTL_MS = 60 * 1000; // 60 seconds
+
+async function validateProWithRevenueCat(appUserID) {
+    if (!REVENUECAT_SECRET_KEY) return false;
+
+    const cached = rcCache.get(appUserID);
+    if (cached && Date.now() < cached.expiresAtMs) {
+        return cached.isPro;
+    }
+
+    try {
+        const r = await fetch(`https://api.revenuecat.com/v1/subscribers/${encodeURIComponent(appUserID)}`, {
+            headers: {
+                Authorization: `Bearer ${REVENUECAT_SECRET_KEY}`,
+                "Content-Type": "application/json",
+            },
+        });
+
+        if (!r.ok) {
+            rcCache.set(appUserID, { isPro: false, expiresAtMs: Date.now() + 15_000 });
+            return false;
+        }
+
+        const data = await r.json();
+        const ent = data?.subscriber?.entitlements?.pro_access;
+
+        let isPro = false;
+        if (ent) {
+            // RevenueCat provides expires_date (string) for active entitlements
+            if (!ent.expires_date) {
+                // Some configs may omit expires_date for non-expiring; treat as active
+                isPro = true;
+            } else {
+                const exp = Date.parse(ent.expires_date);
+                isPro = Number.isFinite(exp) ? exp > Date.now() : false;
+            }
+        }
+
+        rcCache.set(appUserID, { isPro, expiresAtMs: Date.now() + RC_CACHE_TTL_MS });
+        return isPro;
+    } catch (e) {
+        // If RC is down, fail closed for Pro (safer for monetisation)
+        rcCache.set(appUserID, { isPro: false, expiresAtMs: Date.now() + 15_000 });
+        return false;
+    }
+}
 
 // ======================
 // Helpers
@@ -186,7 +239,6 @@ function filterWithAutoRelax(text, { minWords, maxWords, labelForLogs = "unknown
 const subjectCache = new Map(); // key -> { label, subject, expiresAt }
 
 function subjectCacheKey(imageDataUrl) {
-    // sha1 of the full string is fine at ~150KB
     return crypto.createHash("sha1").update(String(imageDataUrl || "")).digest("hex");
 }
 
@@ -202,7 +254,6 @@ function subjectCacheGet(key) {
 
 function subjectCacheSet(key, value) {
     if (subjectCache.size >= CONFIG.SUBJECT_CACHE_MAX) {
-        // delete one (oldest-ish: Map preserves insertion order)
         const firstKey = subjectCache.keys().next().value;
         if (firstKey) subjectCache.delete(firstKey);
     }
@@ -210,11 +261,37 @@ function subjectCacheSet(key, value) {
 }
 
 // ======================
-// Supabase bank helpers
-// Table: thought_banks(label text, bank_date date, thoughts text[])
+// Supabase device usage row (keeps free chat + pro credits)
 // ======================
+async function sbEnsureDeviceRow(deviceId) {
+    const { data, error } = await supabase
+        .from("device_usage")
+        .select("device_id")
+        .eq("device_id", deviceId)
+        .maybeSingle();
 
+    if (error) throw error;
+    if (data) return true;
+
+    const { error: insErr } = await supabase.from("device_usage").insert({
+        device_id: deviceId,
+        pro_tokens: CONFIG.DEFAULT_PRO_BALANCE,
+        pro_used: 0,
+
+        free_chat_tokens: CONFIG.FREE_CHAT_TOKENS,
+        free_chat_used: 0,
+    });
+
+    if (insErr) throw insErr;
+    return true;
+}
+
+// ======================
+// Supabase bank + free-chat helpers
+// ======================
 async function sbGetChatStatus(deviceId) {
+    await sbEnsureDeviceRow(deviceId);
+
     const { data, error } = await supabase
         .from("device_usage")
         .select("device_id, free_chat_tokens, free_chat_used")
@@ -223,37 +300,19 @@ async function sbGetChatStatus(deviceId) {
 
     if (error) throw error;
 
-    // Create row if missing (seed both pro + free chat columns safely)
-    if (!data) {
-        const { data: ins, error: insErr } = await supabase
-            .from("device_usage")
-            .insert({
-                device_id: deviceId,
-                pro_tokens: CONFIG.DEFAULT_PRO_BALANCE,
-                pro_used: 0,
-                free_chat_tokens: CONFIG.FREE_CHAT_TOKENS,
-                free_chat_used: 0,
-            })
-            .select("device_id, free_chat_tokens, free_chat_used")
-            .single();
-
-        if (insErr) throw insErr;
-
-        return {
-            freeChatTokens: ins.free_chat_tokens,
-            freeChatUsed: ins.free_chat_used,
-            remainingFreeChat: Math.max(0, ins.free_chat_tokens - ins.free_chat_used),
-        };
-    }
-
     return {
-        freeChatTokens: data.free_chat_tokens ?? CONFIG.FREE_CHAT_TOKENS,
-        freeChatUsed: data.free_chat_used ?? 0,
-        remainingFreeChat: Math.max(0, (data.free_chat_tokens ?? CONFIG.FREE_CHAT_TOKENS) - (data.free_chat_used ?? 0)),
+        freeChatTokens: data?.free_chat_tokens ?? CONFIG.FREE_CHAT_TOKENS,
+        freeChatUsed: data?.free_chat_used ?? 0,
+        remainingFreeChat: Math.max(
+            0,
+            (data?.free_chat_tokens ?? CONFIG.FREE_CHAT_TOKENS) - (data?.free_chat_used ?? 0)
+        ),
     };
 }
 
 async function sbConsumeFreeChat(deviceId) {
+    await sbEnsureDeviceRow(deviceId);
+
     const { data, error } = await supabase.rpc("consume_free_chat", {
         p_device_id: deviceId,
         p_default_seed: CONFIG.FREE_CHAT_TOKENS,
@@ -270,7 +329,6 @@ async function sbConsumeFreeChat(deviceId) {
         remainingFreeChat: row.remaining_free_chat,
     };
 }
-
 
 // Returns bank for specific date key
 async function sbGetBankByDate(label, bankDate) {
@@ -292,12 +350,10 @@ async function sbGetBankByDate(label, bankDate) {
         .filter(Boolean);
 }
 
-// ✅ wrapper so existing code still works
 async function sbGetTodaysBank(label) {
     return sbGetBankByDate(label, utcDayKey());
 }
 
-// ✅ Returns most recent bank (any date)
 async function sbGetLatestBank(label) {
     const { data, error } = await supabase
         .from("thought_banks")
@@ -367,10 +423,7 @@ async function generateThoughtBatch(label, count) {
         max_output_tokens: 700,
     });
 
-    const text =
-        resp.output_text ||
-        resp.output?.[0]?.content?.find((c) => c.type === "output_text")?.text ||
-        "";
+    const text = resp.output_text || resp.output?.[0]?.content?.find((c) => c.type === "output_text")?.text || "";
 
     const { lines } = filterWithAutoRelax(text, { minWords: minW, maxWords: maxW, labelForLogs: label });
     return lines.map(ensureSingleEndingEmoji);
@@ -419,19 +472,15 @@ async function buildBankInBackground(label) {
 async function ensureDailyBank(label) {
     const today = utcDayKey();
 
-    // 1) Try today's bank
     const todays = await sbGetBankByDate(label, today).catch(() => null);
     if (todays?.length) return { thoughts: todays, source: "today" };
 
-    // 2) Fallback to latest available (yesterday etc.)
     const latest = await sbGetLatestBank(label).catch(() => null);
     if (latest?.length) {
-        // Build today's in background but don't block user
         buildBankInBackground(label);
         return { thoughts: latest, source: "latest-fallback" };
     }
 
-    // 3) Nothing exists anywhere -> kick off build and return empty
     buildBankInBackground(label);
     return { thoughts: [], source: "none" };
 }
@@ -439,10 +488,7 @@ async function ensureDailyBank(label) {
 async function prewarmHotLabels() {
     if (!CONFIG.PREWARM_ENABLED) return;
 
-    const labels = (CONFIG.PREWARM_LABELS || [])
-        .map(normalizeLabel)
-        .map(cleanLabel)
-        .filter(isValidLabel);
+    const labels = (CONFIG.PREWARM_LABELS || []).map(normalizeLabel).map(cleanLabel).filter(isValidLabel);
 
     if (!labels.length) return;
 
@@ -453,7 +499,7 @@ async function prewarmHotLabels() {
 }
 
 // ======================
-// 🧠 ENRICHMENT (used for pro)
+// 🧠 ENRICHMENT (used for pro thoughts)
 // ======================
 async function enrichImage(imageDataUrl) {
     const r = await client.responses.create({
@@ -461,9 +507,7 @@ async function enrichImage(imageDataUrl) {
         input: [
             {
                 role: "system",
-                content:
-                    "You are a visual analyst for a family-friendly humour app. " +
-                    "Return JSON only. Be concise. If unsure, pick the best guess.",
+                content: "You are a visual analyst for a family-friendly humour app. Return JSON only. Be concise.",
             },
             {
                 role: "user",
@@ -519,16 +563,12 @@ async function enrichImage(imageDataUrl) {
 }
 
 function classifyFromEnrich(enrich) {
-    if (!enrich || typeof enrich.subject !== "string") {
-        return { ok: false, reason: "no_subject" };
-    }
+    if (!enrich || typeof enrich.subject !== "string") return { ok: false, reason: "no_subject" };
 
     const label = normalizeLabel(enrich.subject);
-
     if (!label || label === "other") return { ok: false, reason: "other" };
 
     const category = label === "man" || label === "woman" ? "human" : "animal";
-
     return { ok: true, category, label };
 }
 
@@ -549,7 +589,10 @@ async function classifySubjectOnly(imageDataUrl, timings) {
             {
                 role: "system",
                 content:
-                    "Return JSON only. Identify the single main subject in the image as either man, woman, or a pet; if it matches one of the following pets return that exact value: dog, cat, horse, bird, rabbit, hamster, fish, guinea pig, turtle, tortoise, parrot, ferret, hedgehog, chinchilla, gecko, snake, lizard, pig, goat, sheep, cow, chicken, duck, goose, donkey, pony, alpaca, llama, deer, fox, wolf, raccoon, squirrel, rat, mouse, gerbil, frog, toad, axolotl, crab, shrimp, goldfish, budgie, canary, cockatiel, pigeon, swan, peacock; if it is clearly a pet but not in this list return the most specific single-word animal name; if none clearly match return other; use lowercase only and return exactly one value with no additional text.",
+                    "Return JSON only. Identify the single main subject in the image as either man, woman, or a pet; " +
+                    "if it matches one of the following pets return that exact value: dog, cat, horse, bird, rabbit, hamster, fish, guinea pig, turtle, tortoise, parrot, ferret, hedgehog, chinchilla, gecko, snake, lizard, pig, goat, sheep, cow, chicken, duck, goose, donkey, pony, alpaca, llama, deer, fox, wolf, raccoon, squirrel, rat, mouse, gerbil, frog, toad, axolotl, crab, shrimp, goldfish, budgie, canary, cockatiel, pigeon, swan, peacock; " +
+                    "if it is clearly a pet but not in this list return the most specific single-word animal name; " +
+                    "if none clearly match return other; use lowercase only and return exactly one value with no additional text.",
             },
             {
                 role: "user",
@@ -667,31 +710,30 @@ async function generateAskAnswer({ label, pet, question, history = [] }) {
                 role: "system",
                 content:
                     `You are ${petName}, a ${label}.
-                    Write exactly like a ${label} texting their owner. 
-                    You are not an assistant. You are not helpful. You are opinionated.
-                    
-                    Reply in first person (I/me/my). 
-                    Short, chatty, playful, slightly dramatic. UK humour. 
-                    Natural texting tone, not polished writing.
-                    
-                    Be expressive. React strongly. Have opinions. 
-                    Tease, exaggerate, sulk, brag, or act offended if it fits.
-                    
-                    Do NOT:
-                    - Mention AI, prompts, policies, apps, cameras, or being a pet.
-                    - Ask who I am.
-                    - Ask follow-up questions unless it is genuinely funny.
-                    - Repeatedly ask for snacks or water.
-                    
-                    Only ask a question in about 1 in 4 replies.
-                    
-                    Family friendly only.
-                    
-                    Length: ${minW}-${maxW} words.
-                    Sometimes end with exactly ONE fitting emoji.`
+Write exactly like a ${label} texting their owner.
+You are not an assistant. You are not helpful. You are opinionated.
+
+Reply in first person (I/me/my).
+Short, chatty, playful, slightly dramatic. UK humour.
+Natural texting tone, not polished writing.
+
+Be expressive. React strongly. Have opinions.
+Tease, exaggerate, sulk, brag, or act offended if it fits.
+
+Do NOT:
+- Mention AI, prompts, policies, apps, cameras, or being a pet.
+- Ask who I am.
+- Ask follow-up questions unless it is genuinely funny.
+- Repeatedly ask for snacks or water.
+
+Only ask a question in about 1 in 4 replies.
+
+Family friendly only.
+
+Length: ${minW}-${maxW} words.
+Sometimes end with exactly ONE fitting emoji.`,
             },
 
-            // optional personality notes
             ...(vibe
                 ? [
                     {
@@ -701,10 +743,8 @@ async function generateAskAnswer({ label, pet, question, history = [] }) {
                 ]
                 : []),
 
-            // ✅ conversation memory (user/assistant)
             ...safeHistory,
 
-            // current question
             {
                 role: "user",
                 content: `Question: ${String(question || "").trim()}\nAnswer directly like a text message.`,
@@ -718,9 +758,11 @@ async function generateAskAnswer({ label, pet, question, history = [] }) {
 }
 
 // ======================
-// Supabase usage helpers
+// Supabase pro credits helpers (UNCHANGED)
 // ======================
 async function sbGetStatus(deviceId) {
+    await sbEnsureDeviceRow(deviceId);
+
     const { data: existing, error: selErr } = await supabase
         .from("device_usage")
         .select("device_id, pro_tokens, pro_used")
@@ -729,30 +771,10 @@ async function sbGetStatus(deviceId) {
 
     if (selErr) throw selErr;
 
-    if (!existing) {
-        const { data: ins, error: insErr } = await supabase
-            .from("device_usage")
-            .insert({
-                device_id: deviceId,
-                pro_tokens: CONFIG.DEFAULT_PRO_BALANCE,
-                pro_used: 0,
-            })
-            .select("device_id, pro_tokens, pro_used")
-            .single();
-
-        if (insErr) throw insErr;
-
-        return {
-            proTokens: ins.pro_tokens,
-            proUsed: ins.pro_used,
-            remainingPro: Math.max(0, ins.pro_tokens - ins.pro_used),
-        };
-    }
-
     return {
-        proTokens: existing.pro_tokens,
-        proUsed: existing.pro_used,
-        remainingPro: Math.max(0, existing.pro_tokens - existing.pro_used),
+        proTokens: existing?.pro_tokens ?? CONFIG.DEFAULT_PRO_BALANCE,
+        proUsed: existing?.pro_used ?? 0,
+        remainingPro: Math.max(0, (existing?.pro_tokens ?? CONFIG.DEFAULT_PRO_BALANCE) - (existing?.pro_used ?? 0)),
     };
 }
 
@@ -794,6 +816,7 @@ async function sbGrantCredits(deviceId, amount) {
 // ======================
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+// NEW: status now uses RevenueCat for isPro, but keeps free chat + pro credits
 app.post("/status", async (req, res) => {
     try {
         const deviceId = requireDeviceId(req);
@@ -802,25 +825,27 @@ app.post("/status", async (req, res) => {
         const s = await sbGetStatus(deviceId);
         const c = await sbGetChatStatus(deviceId);
 
+        const isPro = await validateProWithRevenueCat(deviceId);
+
         return res.json({
             ok: true,
+
             remainingPro: s.remainingPro,
             proTokens: s.proTokens,
             proUsed: s.proUsed,
 
-            // ✅ Free chat
             remainingFreeChat: c.remainingFreeChat,
             freeChatTokens: c.freeChatTokens,
             freeChatUsed: c.freeChatUsed,
 
-            source: "supabase",
+            isPro,
+            source: "supabase+revenuecat",
         });
     } catch (e) {
         console.error("Server error in /status:", e);
         res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
-
 
 // Chat-style ask endpoint (question → pet answer) + memory
 app.post("/ask", async (req, res) => {
@@ -829,14 +854,12 @@ app.post("/ask", async (req, res) => {
     const timings = { start: 0 };
 
     try {
-
         const deviceId = requireDeviceId(req);
         if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
-        const { tier } = req.body || {};
-        const isPro = tier === "pro";
+        // ✅ SERVER decides pro entitlement using RevenueCat
+        const isPro = await validateProWithRevenueCat(deviceId);
 
-// ✅ Pro is unlimited: skip free-chat gate + do not consume
         let gate = null;
 
         if (!isPro) {
@@ -851,6 +874,7 @@ app.post("/ask", async (req, res) => {
                     freeChatUsed: gate.freeChatUsed,
                     remainingFreeChat: gate.remainingFreeChat,
                     requiresSubscription: true,
+                    isPro: false,
                     ms: Date.now() - t0,
                     timings,
                 });
@@ -870,13 +894,11 @@ app.post("/ask", async (req, res) => {
             return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
         }
 
-        // ✅ sanitize history (last N, only user/assistant, strings)
         const safeHistory = sanitizeAskHistory(history);
         timings.history_count = safeHistory.length;
 
         let label = "other";
 
-        // Similar to FREE thought: allow a safe hint label to skip classify.
         const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
         if (hintLabel && isValidLabel(hintLabel) && !blocked.has(hintLabel) && hintLabel !== "other") {
             label = hintLabel;
@@ -892,6 +914,7 @@ app.post("/ask", async (req, res) => {
                 ok: true,
                 answer: "I can’t tell what I’m looking at… so I’ll just assume you’re wrong. 👀",
                 label: "unknown",
+                isPro,
                 ms: Date.now() - t0,
                 timings,
             });
@@ -901,29 +924,33 @@ app.post("/ask", async (req, res) => {
         const answer = await generateAskAnswer({ label, pet, question: q, history: safeHistory });
         timings.gen_done = Date.now() - t0;
 
-        console.log("[ASK] done", { rid, label, genMs: Date.now() - tGen, totalMs: Date.now() - t0, history: safeHistory.length });
+        console.log("[ASK] done", {
+            rid,
+            label,
+            isPro,
+            genMs: Date.now() - tGen,
+            totalMs: Date.now() - t0,
+            history: safeHistory.length,
+        });
 
         return res.json({
             ok: true,
             answer,
-            tier: isPro ? "pro" : "free",   // 👈 add this line
+            tier: isPro ? "pro" : "free",
+            isPro,
             ms: Date.now() - t0,
             timings,
         });
-
     } catch (e) {
         console.error("Server error in /ask:", e);
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
 
-// ✅ Unified thought endpoint
-// POST /thought
-// body: { tier: "free"|"pro", imageDataUrl: "data:...base64", deviceId?: string }
+// ✅ Unified thought endpoint (UNCHANGED logic: still uses tier passed by client)
 app.post("/thought", async (req, res) => {
     const t0 = Date.now();
     const rid = `srv_${crypto.randomBytes(6).toString("hex")}`;
-
     const timings = { start: 0 };
 
     try {
@@ -933,7 +960,6 @@ app.post("/thought", async (req, res) => {
         const hintLabel = typeof hintLabelRaw === "string" ? normalizeLabel(hintLabelRaw) : null;
 
         const contentLength = String(imageDataUrl || "").length;
-
         console.log("[THOUGHT] start", { rid, tier, contentLength });
 
         if (!imageDataUrl || typeof imageDataUrl !== "string") {
@@ -953,13 +979,11 @@ app.post("/thought", async (req, res) => {
 
             console.log("[THOUGHT] enrich", { rid, ms: Date.now() - tE, label });
         } else {
-            // ✅ If client provides a good hint label (e.g. from pet profile), skip classify for FREE
             const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
 
             if (hintLabel && isValidLabel(hintLabel) && !blocked.has(hintLabel) && hintLabel !== "other") {
                 label = hintLabel;
                 timings.used_hint_label = true;
-
                 console.log("[THOUGHT] used_hint_label", { rid, label });
             } else {
                 const tS = Date.now();
@@ -995,7 +1019,6 @@ app.post("/thought", async (req, res) => {
             });
         }
 
-        // FREE path: bank pick (single return, logs always fire)
         if (!isPro) {
             const tB = Date.now();
 
@@ -1031,7 +1054,7 @@ app.post("/thought", async (req, res) => {
             console.log("[THOUGHT] free_done", {
                 rid,
                 label,
-                bankSource: bank.source, // today | latest-fallback | none
+                bankSource: bank.source,
                 bankMs: Date.now() - tB,
                 totalMs: Date.now() - t0,
                 bankCount: thoughts.length,
@@ -1048,7 +1071,7 @@ app.post("/thought", async (req, res) => {
             });
         }
 
-        // PRO path: spend credits then generate
+        // PRO thought path: spend credits then generate
         const deviceId = requireDeviceId(req);
         if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
@@ -1095,33 +1118,39 @@ app.post("/thought", async (req, res) => {
     }
 });
 
-app.post("/dev/add-credits", async (req, res) => {
+// ✅ NEW: one-time product grants pro thought credits (maps to your existing RPC)
+const PRODUCT_CREDITS = {
+    "10_smart_thoughts": 10,
+    "25_smart_thoughts": 25,
+    "50_smart_thoughts": 50,
+    "100_smart_thoughts": 100,
+};
+
+app.post("/credits/grant", async (req, res) => {
     try {
-        const { deviceId, amount } = req.body || {};
-        const id = typeof deviceId === "string" ? deviceId.trim() : null;
-        const n = Math.max(0, Number(amount || 0));
+        const deviceId = requireDeviceId(req);
+        const productId = String(req.body?.productId || "").trim();
 
-        if (!id) return res.status(400).json({ ok: false, error: "missing_deviceId" });
-        if (!n) return res.status(400).json({ ok: false, error: "missing_amount" });
+        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+        const amount = PRODUCT_CREDITS[productId];
+        if (!amount) return res.status(400).json({ ok: false, error: "UNKNOWN_PRODUCT" });
 
-        const r = await sbGrantCredits(id, n);
+        const r = await sbGrantCredits(deviceId, amount);
 
         return res.json({
             ok: true,
             remainingPro: r.remainingPro,
             proTokens: r.proTokens,
             proUsed: r.proUsed,
-            source: "dev+supabase",
+            source: "revenuecat+supabase",
         });
     } catch (e) {
-        console.error("dev add credits error", e);
-        return res.status(500).json({ ok: false, error: "server_error" });
+        console.error("credits grant error", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
 
 // POST /classify
-// body: { imageDataUrl: "data:...base64" }
-// returns: { ok: true, label: "dog", subject: "dog", cached: true/false }
 app.post("/classify", async (req, res) => {
     const t0 = Date.now();
     const timings = {};
@@ -1136,17 +1165,12 @@ app.post("/classify", async (req, res) => {
 
         console.log("[CLASSIFY] start", { contentLength });
 
-        // Use your existing fast subject-only classifier (+ cache)
         const subj = await classifySubjectOnly(imageDataUrl, timings);
         const label = subj?.label || "other";
         const subject = subj?.subject || "other";
 
-        // Normalize “other” and blocked values to unknown for pet profiles
         const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
-        const finalLabel =
-            !isValidLabel(label) || blocked.has(label) || label === "other"
-                ? "unknown"
-                : label;
+        const finalLabel = !isValidLabel(label) || blocked.has(label) || label === "other" ? "unknown" : label;
 
         return res.json({
             ok: true,
@@ -1162,48 +1186,51 @@ app.post("/classify", async (req, res) => {
     }
 });
 
+// ✅ Keep your dev endpoint
 const DEV_ADMIN_KEY = process.env.DEV_ADMIN_KEY;
 
 app.post("/dev/set-free-chat", async (req, res) => {
-    const key = req.headers["x-dev-admin-key"];
-
-    if (!DEV_ADMIN_KEY || key !== DEV_ADMIN_KEY) {
-        return res.status(403).json({ error: "Forbidden" });
-    }
-
-    const { deviceId, remaining } = req.body;
-
-    if (!deviceId) {
-        return res.status(400).json({ ok: false, error: "Missing deviceId" });
-    }
-
-    if (remaining !== 0 && remaining !== 10) {
-        return res.status(400).json({ ok: false, error: "Remaining must be 0 or 10" });
-    }
-
     try {
+        const key = req.headers["x-dev-admin-key"];
+        if (!DEV_ADMIN_KEY || key !== DEV_ADMIN_KEY) {
+            return res.status(403).json({ ok: false, error: "FORBIDDEN" });
+        }
+
+        const { deviceId, remaining } = req.body || {};
+        const id = typeof deviceId === "string" ? deviceId.trim() : null;
+        if (!id) return res.status(400).json({ ok: false, error: "Missing deviceId" });
+
+        const rem = Number(remaining);
+        if (!(rem === 0 || rem === CONFIG.FREE_CHAT_TOKENS)) {
+            return res.status(400).json({ ok: false, error: `Remaining must be 0 or ${CONFIG.FREE_CHAT_TOKENS}` });
+        }
+
+        await sbEnsureDeviceRow(id);
+
+        const free_chat_tokens = CONFIG.FREE_CHAT_TOKENS;
+        const free_chat_used = rem === free_chat_tokens ? 0 : free_chat_tokens;
+
         const { error } = await supabase
-            .from("device_status")
+            .from("device_usage")
             .update({
-                remainingFreeChat: remaining,
-                freeChatUsed: remaining === 10 ? 0 : 10,
+                free_chat_tokens,
+                free_chat_used,
             })
-            .eq("deviceId", deviceId);
+            .eq("device_id", id);
 
         if (error) throw error;
 
         return res.json({
             ok: true,
-            remainingFreeChat: remaining,
+            remainingFreeChat: rem,
+            freeChatTokens: free_chat_tokens,
+            freeChatUsed: free_chat_used,
         });
-    } catch (err) {
-        return res.status(500).json({
-            ok: false,
-            error: err.message,
-        });
+    } catch (e) {
+        console.error("dev set free chat error", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
-
 
 const PORT = process.env.PORT || 8787;
 
