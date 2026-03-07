@@ -84,6 +84,16 @@ const supabase = createClient(SUPABASE_URL || "http://invalid", SUPABASE_SERVICE
     auth: { persistSession: false },
 });
 
+async function resolveIdentityId(req) {
+    const explicit = requireIdentityId(req);
+    if (explicit) return explicit;
+
+    const user = await getSupabaseUserFromBearer(req);
+    if (user?.id) return makeUserIdentityId(user.id);
+
+    return null;
+}
+
 function requireIdentityId(req) {
     const id = req.body?.identityId ?? req.body?.deviceId;
     if (typeof id !== "string") return null;
@@ -908,7 +918,7 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 // status uses RevenueCat for isPro, keeps free chat + pro credits
 app.post("/status", async (req, res) => {
     try {
-        const deviceId = requireIdentityId(req);
+        const deviceId = await resolveIdentityId(req);
         if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
         const s = await sbGetStatus(deviceId);
@@ -942,7 +952,7 @@ app.post("/ask", async (req, res) => {
     const timings = { start: 0 };
 
     try {
-        const deviceId = requireIdentityId(req);
+        const deviceId = await resolveIdentityId(req);
         if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
         // ✅ SERVER decides pro entitlement using RevenueCat
@@ -1160,7 +1170,7 @@ app.post("/thought", async (req, res) => {
         }
 
         // PRO thought path: spend credits then generate
-        const deviceId = requireIdentityId(req);
+        const deviceId = await resolveIdentityId(req);
         if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
         const tSpend = Date.now();
@@ -1397,7 +1407,7 @@ app.post("/credits/grant", async (req, res) => {
             return res.status(403).json({ ok: false, error: "FORBIDDEN" });
         }
 
-        const deviceId = requireIdentityId(req);
+        const deviceId = await resolveIdentityId(req);
         const productId = String(req.body?.productId || "").trim();
         if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
