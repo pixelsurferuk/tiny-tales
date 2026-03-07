@@ -6,6 +6,7 @@ import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 
+
 const app = express();
 app.use(cors());
 
