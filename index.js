@@ -44,7 +44,7 @@ const CONFIG = {
     PREWARM_ON_START: true,
     PREWARM_CHECK_INTERVAL_MINUTES: 60,
 
-    DEFAULT_PRO_BALANCE: Number(process.env.DEFAULT_PRO_BALANCE || 5),
+    DEFAULT_PRO_BALANCE: Number(process.env.DEFAULT_PRO_BALANCE || 1),
 
     // ✅ Subject-only cache (free)
     SUBJECT_CACHE_TTL_MS: 10 * 60 * 1000, // 10 minutes
@@ -55,7 +55,7 @@ const CONFIG = {
     ASK_HISTORY_MAX_CHARS: 420,
 
     // ✅ Free chat tokens (kept!)
-    FREE_CHAT_TOKENS: Number(process.env.FREE_CHAT_TOKENS || 10),
+    FREE_CHAT_TOKENS: Number(process.env.FREE_CHAT_TOKENS || 1),
 
     // RevenueCat entitlement id (your dashboard: Entitlements -> Identifier)
     RC_ENTITLEMENT_ID: process.env.RC_ENTITLEMENT_ID || "pro_access",
@@ -83,12 +83,28 @@ const supabase = createClient(SUPABASE_URL || "http://invalid", SUPABASE_SERVICE
     auth: { persistSession: false },
 });
 
-function requireDeviceId(req) {
-    const id = req.body?.deviceId;
+function requireIdentityId(req) {
+    const id = req.body?.identityId ?? req.body?.deviceId;
     if (typeof id !== "string") return null;
     const trimmed = id.trim();
     if (trimmed.length < 3) return null;
     return trimmed;
+}
+
+function makeDeviceIdentityId(deviceId) {
+    const id = String(deviceId || "").trim();
+    if (!id) return null;
+    return id.startsWith("device:") ? id : `device:${id}`;
+}
+
+function makeUserIdentityId(userId) {
+    const id = String(userId || "").trim();
+    if (!id) return null;
+    return id.startsWith("user:") ? id : `user:${id}`;
+}
+
+function makeLoginBonusMarker(userId) {
+    return `bonus:${String(userId || "").trim()}`;
 }
 
 function jwtRole(key) {
@@ -109,6 +125,7 @@ console.log("SUPABASE key role:", jwtRole(process.env.SUPABASE_SERVICE_ROLE_KEY 
 const REVENUECAT_SECRET_KEY = process.env.REVENUECAT_SECRET_KEY;
 const rcCache = new Map(); // appUserID -> { isPro, expiresAtMs }
 const RC_CACHE_TTL_MS = CONFIG.RC_CACHE_TTL_MS;
+const LOGIN_BONUS_AMOUNT = Number(process.env.LOGIN_BONUS_AMOUNT || 5);
 
 async function validateProWithRevenueCat(appUserID) {
     if (!REVENUECAT_SECRET_KEY) return false;
@@ -153,6 +170,45 @@ async function validateProWithRevenueCat(appUserID) {
         rcCache.set(appUserID, { isPro: false, expiresAtMs: Date.now() + 15_000 });
         return false;
     }
+}
+
+
+async function getSupabaseUserFromBearer(req) {
+    const auth = String(req.headers?.authorization || "").trim();
+    if (!auth.toLowerCase().startsWith("bearer ")) return null;
+
+    const token = auth.slice(7).trim();
+    if (!token) return null;
+
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) return null;
+    return data.user;
+}
+
+async function bonusAlreadyGranted(userId) {
+    const marker = makeLoginBonusMarker(userId);
+    const { data, error } = await supabase.from("device_usage").select("device_id").eq("device_id", marker).maybeSingle();
+    if (error) throw error;
+    return !!data?.device_id;
+}
+
+async function markBonusGranted(userId) {
+    const marker = makeLoginBonusMarker(userId);
+    const { error } = await supabase.from("device_usage").insert({
+        device_id: marker,
+        free_chat_tokens: 0,
+        free_chat_used: 0,
+        pro_tokens: 0,
+        pro_used: 0,
+    });
+
+    if (error) {
+        const msg = String(error.message || error);
+        if (msg.toLowerCase().includes("duplicate") || msg.toLowerCase().includes("unique")) return false;
+        throw error;
+    }
+
+    return true;
 }
 
 // ======================
@@ -851,7 +907,7 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 // status uses RevenueCat for isPro, keeps free chat + pro credits
 app.post("/status", async (req, res) => {
     try {
-        const deviceId = requireDeviceId(req);
+        const deviceId = requireIdentityId(req);
         if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
         const s = await sbGetStatus(deviceId);
@@ -885,7 +941,7 @@ app.post("/ask", async (req, res) => {
     const timings = { start: 0 };
 
     try {
-        const deviceId = requireDeviceId(req);
+        const deviceId = requireIdentityId(req);
         if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
         // ✅ SERVER decides pro entitlement using RevenueCat
@@ -1103,7 +1159,7 @@ app.post("/thought", async (req, res) => {
         }
 
         // PRO thought path: spend credits then generate
-        const deviceId = requireDeviceId(req);
+        const deviceId = requireIdentityId(req);
         if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
         const tSpend = Date.now();
@@ -1242,6 +1298,47 @@ app.post("/revenuecat/webhook", async (req, res) => {
     }
 });
 
+// Login bonus for authenticated users
+app.post("/auth/login-bonus", async (req, res) => {
+    try {
+        const user = await getSupabaseUserFromBearer(req);
+        if (!user?.id) return res.status(401).json({ ok: false, error: "UNAUTHENTICATED" });
+
+        const userIdentityId = makeUserIdentityId(user.id);
+        const alreadyGranted = await bonusAlreadyGranted(user.id);
+
+        let granted = false;
+        if (!alreadyGranted) {
+            const marked = await markBonusGranted(user.id);
+            if (marked) {
+                await sbGrantCredits(userIdentityId, LOGIN_BONUS_AMOUNT);
+                granted = true;
+            }
+        }
+
+        const s = await sbGetStatus(userIdentityId);
+        const c = await sbGetChatStatus(userIdentityId);
+        const isPro = await validateProWithRevenueCat(userIdentityId);
+
+        return res.json({
+            ok: true,
+            granted,
+            bonusAmount: granted ? LOGIN_BONUS_AMOUNT : 0,
+            identityId: userIdentityId,
+            remainingPro: s.remainingPro,
+            proTokens: s.proTokens,
+            proUsed: s.proUsed,
+            remainingFreeChat: c.remainingFreeChat,
+            freeChatTokens: c.freeChatTokens,
+            freeChatUsed: c.freeChatUsed,
+            isPro,
+        });
+    } catch (e) {
+        console.error("login bonus error", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    }
+});
+
 // ======================
 // DEV-only endpoint (optional)
 // ======================
@@ -1299,7 +1396,7 @@ app.post("/credits/grant", async (req, res) => {
             return res.status(403).json({ ok: false, error: "FORBIDDEN" });
         }
 
-        const deviceId = requireDeviceId(req);
+        const deviceId = requireIdentityId(req);
         const productId = String(req.body?.productId || "").trim();
         if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
