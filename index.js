@@ -6,12 +6,8 @@ import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 
-
 const app = express();
 app.use(cors());
-
-// Keep JSON for normal endpoints.
-// RevenueCat webhooks are JSON too; we’ll auth them via header token (simplest + robust).
 app.use(express.json({ limit: "20mb" }));
 
 // ======================
@@ -28,7 +24,6 @@ const CONFIG = {
     PRO_THOUGHT_MIN_WORDS: 10,
     PRO_THOUGHT_MAX_WORDS: 35,
 
-    // Ask-a-question replies (short + punchy)
     ASK_MIN_WORDS: 10,
     ASK_MAX_WORDS: 35,
 
@@ -45,26 +40,22 @@ const CONFIG = {
     PREWARM_ON_START: true,
     PREWARM_CHECK_INTERVAL_MINUTES: 60,
 
-    DEFAULT_PRO_BALANCE: Number(process.env.DEFAULT_PRO_BALANCE || 1),
+    // Guest defaults
+    DEFAULT_GUEST_PRO_BALANCE: Number(process.env.DEFAULT_GUEST_PRO_BALANCE || 1),
+    DEFAULT_GUEST_FREE_CHAT_TOKENS: Number(process.env.DEFAULT_GUEST_FREE_CHAT_TOKENS || 1),
 
-    // ✅ Subject-only cache (free)
-    SUBJECT_CACHE_TTL_MS: 10 * 60 * 1000, // 10 minutes
+    // New logged-in account defaults
+    DEFAULT_USER_PRO_BALANCE: Number(process.env.DEFAULT_USER_PRO_BALANCE || 5),
+    DEFAULT_USER_FREE_CHAT_TOKENS: Number(process.env.DEFAULT_USER_FREE_CHAT_TOKENS || 5),
+
+    SUBJECT_CACHE_TTL_MS: 10 * 60 * 1000,
     SUBJECT_CACHE_MAX: 2000,
 
-    // ✅ Ask chat memory
     ASK_HISTORY_MAX: 10,
     ASK_HISTORY_MAX_CHARS: 420,
 
-    // ✅ Free chat tokens (kept!)
-    FREE_CHAT_TOKENS: Number(process.env.FREE_CHAT_TOKENS || 1),
-
-    // RevenueCat entitlement id (your dashboard: Entitlements -> Identifier)
     RC_ENTITLEMENT_ID: process.env.RC_ENTITLEMENT_ID || "pro_access",
-
-    // RevenueCat webhook auth token (set this in RC dashboard webhook config + server env)
     RC_WEBHOOK_AUTH: process.env.RC_WEBHOOK_AUTH || "",
-
-    // Cache RC subscriber lookup briefly to reduce API calls
     RC_CACHE_TTL_MS: 60 * 1000,
 };
 
@@ -84,6 +75,14 @@ const supabase = createClient(SUPABASE_URL || "http://invalid", SUPABASE_SERVICE
     auth: { persistSession: false },
 });
 
+function requireIdentityId(req) {
+    const id = req.body?.identityId ?? req.body?.deviceId;
+    if (typeof id !== "string") return null;
+    const trimmed = id.trim();
+    if (trimmed.length < 3) return null;
+    return trimmed;
+}
+
 async function resolveIdentityId(req) {
     const explicit = requireIdentityId(req);
     if (explicit) return explicit;
@@ -94,18 +93,10 @@ async function resolveIdentityId(req) {
     return null;
 }
 
-function requireIdentityId(req) {
-    const id = req.body?.identityId ?? req.body?.deviceId;
-    if (typeof id !== "string") return null;
-    const trimmed = id.trim();
-    if (trimmed.length < 3) return null;
-    return trimmed;
-}
-
 function makeDeviceIdentityId(deviceId) {
     const id = String(deviceId || "").trim();
     if (!id) return null;
-    return id.startsWith("device:") ? id : `device:${id}`;
+    return id.startsWith("guest_") ? id : `guest_${id}`;
 }
 
 function makeUserIdentityId(userId) {
@@ -114,15 +105,12 @@ function makeUserIdentityId(userId) {
     return id.startsWith("user:") ? id : `user:${id}`;
 }
 
-function makeLoginBonusMarker(userId) {
-    return `bonus:${String(userId || "").trim()}`;
-}
-
 function jwtRole(key) {
     try {
         const payload = key.split(".")[1];
         const json = Buffer.from(payload, "base64").toString("utf8");
-        return JSON.parse(json).role || JSON.parse(json).aud;
+        const parsed = JSON.parse(json);
+        return parsed.role || parsed.aud;
     } catch {
         return "unreadable";
     }
@@ -134,9 +122,7 @@ console.log("SUPABASE key role:", jwtRole(process.env.SUPABASE_SERVICE_ROLE_KEY 
 // RevenueCat server-side validation
 // ======================
 const REVENUECAT_SECRET_KEY = process.env.REVENUECAT_SECRET_KEY;
-const rcCache = new Map(); // appUserID -> { isPro, expiresAtMs }
-const RC_CACHE_TTL_MS = CONFIG.RC_CACHE_TTL_MS;
-const LOGIN_BONUS_AMOUNT = Number(process.env.LOGIN_BONUS_AMOUNT || 5);
+const rcCache = new Map();
 
 async function validateProWithRevenueCat(appUserID) {
     if (!REVENUECAT_SECRET_KEY) return false;
@@ -155,7 +141,6 @@ async function validateProWithRevenueCat(appUserID) {
         });
 
         if (!r.ok) {
-            // short negative cache to avoid hammering RC if key misconfigured etc.
             rcCache.set(appUserID, { isPro: false, expiresAtMs: Date.now() + 15_000 });
             return false;
         }
@@ -166,7 +151,6 @@ async function validateProWithRevenueCat(appUserID) {
         let isPro = false;
         if (ent) {
             if (!ent.expires_date) {
-                // non-expiring entitlement
                 isPro = true;
             } else {
                 const exp = Date.parse(ent.expires_date);
@@ -174,15 +158,13 @@ async function validateProWithRevenueCat(appUserID) {
             }
         }
 
-        rcCache.set(appUserID, { isPro, expiresAtMs: Date.now() + RC_CACHE_TTL_MS });
+        rcCache.set(appUserID, { isPro, expiresAtMs: Date.now() + CONFIG.RC_CACHE_TTL_MS });
         return isPro;
-    } catch (e) {
-        // Fail closed for pro (safer for monetisation)
+    } catch {
         rcCache.set(appUserID, { isPro: false, expiresAtMs: Date.now() + 15_000 });
         return false;
     }
 }
-
 
 async function getSupabaseUserFromBearer(req) {
     const auth = String(req.headers?.authorization || "").trim();
@@ -194,32 +176,6 @@ async function getSupabaseUserFromBearer(req) {
     const { data, error } = await supabase.auth.getUser(token);
     if (error || !data?.user) return null;
     return data.user;
-}
-
-async function bonusAlreadyGranted(userId) {
-    const marker = makeLoginBonusMarker(userId);
-    const { data, error } = await supabase.from("device_usage").select("device_id").eq("device_id", marker).maybeSingle();
-    if (error) throw error;
-    return !!data?.device_id;
-}
-
-async function markBonusGranted(userId) {
-    const marker = makeLoginBonusMarker(userId);
-    const { error } = await supabase.from("device_usage").insert({
-        device_id: marker,
-        free_chat_tokens: 0,
-        free_chat_used: 0,
-        pro_tokens: 0,
-        pro_used: 0,
-    });
-
-    if (error) {
-        const msg = String(error.message || error);
-        if (msg.toLowerCase().includes("duplicate") || msg.toLowerCase().includes("unique")) return false;
-        throw error;
-    }
-
-    return true;
 }
 
 // ======================
@@ -312,9 +268,9 @@ function filterWithAutoRelax(text, { minWords, maxWords, labelForLogs = "unknown
 }
 
 // ======================
-// Subject-only cache (FREE)
+// Subject-only cache
 // ======================
-const subjectCache = new Map(); // key -> { label, subject, expiresAt }
+const subjectCache = new Map();
 
 function subjectCacheKey(imageDataUrl) {
     return crypto.createHash("sha1").update(String(imageDataUrl || "")).digest("hex");
@@ -339,18 +295,23 @@ function subjectCacheSet(key, value) {
 }
 
 // ======================
-// Supabase device usage row (keeps free chat + pro credits)
+// Usage row helpers
 // ======================
-async function sbEnsureDeviceRow(deviceId) {
-    const { data, error } = await supabase.from("device_usage").select("device_id").eq("device_id", deviceId).maybeSingle();
+async function sbEnsureUsageRow(identityId, { proTokens, freeChatTokens }) {
+    const { data, error } = await supabase
+        .from("device_usage")
+        .select("device_id")
+        .eq("device_id", identityId)
+        .maybeSingle();
+
     if (error) throw error;
-    if (data) return true;
+    if (data) return false;
 
     const { error: insErr } = await supabase.from("device_usage").insert({
-        device_id: deviceId,
-        pro_tokens: CONFIG.DEFAULT_PRO_BALANCE,
+        device_id: identityId,
+        pro_tokens: proTokens,
         pro_used: 0,
-        free_chat_tokens: CONFIG.FREE_CHAT_TOKENS,
+        free_chat_tokens: freeChatTokens,
         free_chat_used: 0,
     });
 
@@ -358,39 +319,61 @@ async function sbEnsureDeviceRow(deviceId) {
     return true;
 }
 
+async function sbEnsureDeviceRow(deviceId) {
+    return sbEnsureUsageRow(deviceId, {
+        proTokens: CONFIG.DEFAULT_GUEST_PRO_BALANCE,
+        freeChatTokens: CONFIG.DEFAULT_GUEST_FREE_CHAT_TOKENS,
+    });
+}
+
+async function sbEnsureIdentityRow(identityId) {
+    const isUser = String(identityId).startsWith("user:");
+    return sbEnsureUsageRow(identityId, {
+        proTokens: isUser ? CONFIG.DEFAULT_USER_PRO_BALANCE : CONFIG.DEFAULT_GUEST_PRO_BALANCE,
+        freeChatTokens: isUser ? CONFIG.DEFAULT_USER_FREE_CHAT_TOKENS : CONFIG.DEFAULT_GUEST_FREE_CHAT_TOKENS,
+    });
+}
+
 // ======================
-// Supabase bank + free-chat helpers
+// Free-chat helpers
 // ======================
-async function sbGetChatStatus(deviceId) {
-    await sbEnsureDeviceRow(deviceId);
+async function sbGetChatStatus(identityId) {
+    await sbEnsureIdentityRow(identityId);
 
     const { data, error } = await supabase
         .from("device_usage")
         .select("device_id, free_chat_tokens, free_chat_used")
-        .eq("device_id", deviceId)
+        .eq("device_id", identityId)
         .maybeSingle();
 
     if (error) throw error;
 
+    const fallback = String(identityId).startsWith("user:")
+        ? CONFIG.DEFAULT_USER_FREE_CHAT_TOKENS
+        : CONFIG.DEFAULT_GUEST_FREE_CHAT_TOKENS;
+
     return {
-        freeChatTokens: data?.free_chat_tokens ?? CONFIG.FREE_CHAT_TOKENS,
+        freeChatTokens: data?.free_chat_tokens ?? fallback,
         freeChatUsed: data?.free_chat_used ?? 0,
-        remainingFreeChat: Math.max(0, (data?.free_chat_tokens ?? CONFIG.FREE_CHAT_TOKENS) - (data?.free_chat_used ?? 0)),
+        remainingFreeChat: Math.max(0, (data?.free_chat_tokens ?? fallback) - (data?.free_chat_used ?? 0)),
     };
 }
 
-async function sbConsumeFreeChat(deviceId) {
-    await sbEnsureDeviceRow(deviceId);
+async function sbConsumeFreeChat(identityId) {
+    await sbEnsureIdentityRow(identityId);
+
+    const fallback = String(identityId).startsWith("user:")
+        ? CONFIG.DEFAULT_USER_FREE_CHAT_TOKENS
+        : CONFIG.DEFAULT_GUEST_FREE_CHAT_TOKENS;
 
     const { data, error } = await supabase.rpc("consume_free_chat", {
-        p_device_id: deviceId,
-        p_default_seed: CONFIG.FREE_CHAT_TOKENS,
+        p_device_id: identityId,
+        p_default_seed: fallback,
     });
 
     if (error) throw error;
 
     const row = Array.isArray(data) ? data[0] : data;
-
     return {
         ok: !!row.ok,
         freeChatTokens: row.free_chat_tokens,
@@ -399,7 +382,9 @@ async function sbConsumeFreeChat(deviceId) {
     };
 }
 
-// Returns bank for specific date key
+// ======================
+// Thought bank helpers
+// ======================
 async function sbGetBankByDate(label, bankDate) {
     const { data, error } = await supabase
         .from("thought_banks")
@@ -493,7 +478,6 @@ async function generateThoughtBatch(label, count) {
     });
 
     const text = resp.output_text || resp.output?.[0]?.content?.find((c) => c.type === "output_text")?.text || "";
-
     const { lines } = filterWithAutoRelax(text, { minWords: minW, maxWords: maxW, labelForLogs: label });
     return lines.map(ensureSingleEndingEmoji);
 }
@@ -567,7 +551,7 @@ async function prewarmHotLabels() {
 }
 
 // ======================
-// 🧠 ENRICHMENT (used for pro thoughts)
+// Enrichment
 // ======================
 async function enrichImage(imageDataUrl) {
     const r = await client.responses.create({
@@ -641,7 +625,7 @@ function classifyFromEnrich(enrich) {
 }
 
 // ======================
-// Subject-only classify (used for free) + cache
+// Subject-only classify
 // ======================
 async function classifySubjectOnly(imageDataUrl, timings) {
     const key = subjectCacheKey(imageDataUrl);
@@ -743,7 +727,7 @@ async function generateProThought(label, enrich) {
 }
 
 // ======================
-// Ask-a-question generator (with chat history)
+// Ask generator
 // ======================
 function sanitizeAskHistory(history) {
     if (!Array.isArray(history)) return [];
@@ -768,7 +752,6 @@ async function generateAskAnswer({ label, pet, question, history = [] }) {
 
     const petName = String(pet?.name || "my pet").trim() || "my pet";
     const vibe = String(pet?.vibe || "").trim();
-
     const safeHistory = sanitizeAskHistory(history);
 
     const r = await client.responses.create({
@@ -823,31 +806,39 @@ Sometimes end with exactly ONE fitting emoji.`,
 }
 
 // ======================
-// Supabase pro credits helpers
+// Pro credits helpers
 // ======================
-async function sbGetStatus(deviceId) {
-    await sbEnsureDeviceRow(deviceId);
+async function sbGetStatus(identityId) {
+    await sbEnsureIdentityRow(identityId);
 
     const { data: existing, error: selErr } = await supabase
         .from("device_usage")
         .select("device_id, pro_tokens, pro_used")
-        .eq("device_id", deviceId)
+        .eq("device_id", identityId)
         .maybeSingle();
 
     if (selErr) throw selErr;
 
+    const fallback = String(identityId).startsWith("user:")
+        ? CONFIG.DEFAULT_USER_PRO_BALANCE
+        : CONFIG.DEFAULT_GUEST_PRO_BALANCE;
+
     return {
-        proTokens: existing?.pro_tokens ?? CONFIG.DEFAULT_PRO_BALANCE,
+        proTokens: existing?.pro_tokens ?? fallback,
         proUsed: existing?.pro_used ?? 0,
-        remainingPro: Math.max(0, (existing?.pro_tokens ?? CONFIG.DEFAULT_PRO_BALANCE) - (existing?.pro_used ?? 0)),
+        remainingPro: Math.max(0, (existing?.pro_tokens ?? fallback) - (existing?.pro_used ?? 0)),
     };
 }
 
-async function sbSpendCredits(deviceId, cost) {
+async function sbSpendCredits(identityId, cost) {
+    const fallback = String(identityId).startsWith("user:")
+        ? CONFIG.DEFAULT_USER_PRO_BALANCE
+        : CONFIG.DEFAULT_GUEST_PRO_BALANCE;
+
     const { data, error } = await supabase.rpc("spend_pro_credits", {
-        p_device_id: deviceId,
+        p_device_id: identityId,
         p_cost: cost,
-        p_default_seed: CONFIG.DEFAULT_PRO_BALANCE,
+        p_default_seed: fallback,
     });
 
     if (error) throw error;
@@ -860,11 +851,15 @@ async function sbSpendCredits(deviceId, cost) {
     };
 }
 
-async function sbGrantCredits(deviceId, amount) {
+async function sbGrantCredits(identityId, amount) {
+    const fallback = String(identityId).startsWith("user:")
+        ? CONFIG.DEFAULT_USER_PRO_BALANCE
+        : CONFIG.DEFAULT_GUEST_PRO_BALANCE;
+
     const { data, error } = await supabase.rpc("grant_pro_credits", {
-        p_device_id: deviceId,
+        p_device_id: identityId,
         p_amount: amount,
-        p_default_seed: CONFIG.DEFAULT_PRO_BALANCE,
+        p_default_seed: fallback,
     });
 
     if (error) throw error;
@@ -886,27 +881,22 @@ const PRODUCT_CREDITS = {
     "100_smart_thoughts": 100,
 };
 
-// Inserts event id into a dedupe table; returns true if new, false if already processed
 async function rcDedupe(eventId, appUserId, productId) {
-    if (!eventId) return true; // if RC ever omits, fail open but log in webhook handler
+    if (!eventId) return true;
 
-    const { data, error } = await supabase
+    const { error } = await supabase
         .from("revenuecat_events")
         .insert({
             event_id: eventId,
             app_user_id: appUserId || null,
             product_id: productId || null,
-        })
-        .select("event_id")
-        .maybeSingle();
+        });
 
     if (!error) return true;
 
-    // unique violation = already processed
     const msg = String(error.message || "");
     if (msg.toLowerCase().includes("duplicate") || msg.toLowerCase().includes("unique")) return false;
 
-    // unknown error: be safe and block double-grant
     throw error;
 }
 
@@ -915,16 +905,14 @@ async function rcDedupe(eventId, appUserId, productId) {
 // ======================
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// status uses RevenueCat for isPro, keeps free chat + pro credits
 app.post("/status", async (req, res) => {
     try {
-        const deviceId = await resolveIdentityId(req);
-        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
-        const s = await sbGetStatus(deviceId);
-        const c = await sbGetChatStatus(deviceId);
-
-        const isPro = await validateProWithRevenueCat(deviceId);
+        const s = await sbGetStatus(identityId);
+        const c = await sbGetChatStatus(identityId);
+        const isPro = await validateProWithRevenueCat(identityId);
 
         return res.json({
             ok: true,
@@ -945,23 +933,20 @@ app.post("/status", async (req, res) => {
     }
 });
 
-// Chat-style ask endpoint (question → pet answer) + memory
 app.post("/ask", async (req, res) => {
     const t0 = Date.now();
     const rid = `srv_${crypto.randomBytes(6).toString("hex")}`;
     const timings = { start: 0 };
 
     try {
-        const deviceId = await resolveIdentityId(req);
-        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
-        // ✅ SERVER decides pro entitlement using RevenueCat
-        const isPro = await validateProWithRevenueCat(deviceId);
-
+        const isPro = await validateProWithRevenueCat(identityId);
         let gate = null;
 
         if (!isPro) {
-            gate = await sbConsumeFreeChat(deviceId);
+            gate = await sbConsumeFreeChat(identityId);
             timings.free_chat_gate = gate;
 
             if (!gate.ok) {
@@ -996,8 +981,8 @@ app.post("/ask", async (req, res) => {
         timings.history_count = safeHistory.length;
 
         let label = "other";
-
         const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
+
         if (hintLabel && isValidLabel(hintLabel) && !blocked.has(hintLabel) && hintLabel !== "other") {
             label = hintLabel;
             timings.used_hint_label = true;
@@ -1045,7 +1030,6 @@ app.post("/ask", async (req, res) => {
     }
 });
 
-// ✅ Unified thought endpoint (your original behaviour kept: tier still client-driven)
 app.post("/thought", async (req, res) => {
     const t0 = Date.now();
     const rid = `srv_${crypto.randomBytes(6).toString("hex")}`;
@@ -1119,10 +1103,8 @@ app.post("/thought", async (req, res) => {
 
         if (!isPro) {
             const tB = Date.now();
-
             const bank = await ensureDailyBank(label);
             const thoughts = bank.thoughts;
-
             timings.bank_fetch_done = Date.now() - t0;
 
             if (!thoughts?.length) {
@@ -1169,12 +1151,11 @@ app.post("/thought", async (req, res) => {
             });
         }
 
-        // PRO thought path: spend credits then generate
-        const deviceId = await resolveIdentityId(req);
-        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
         const tSpend = Date.now();
-        const spend = await sbSpendCredits(deviceId, 1);
+        const spend = await sbSpendCredits(identityId, 1);
         timings.credits_spend_done = Date.now() - t0;
 
         console.log("[THOUGHT] spend", {
@@ -1216,7 +1197,6 @@ app.post("/thought", async (req, res) => {
     }
 });
 
-// POST /classify
 app.post("/classify", async (req, res) => {
     const t0 = Date.now();
     const timings = {};
@@ -1253,11 +1233,10 @@ app.post("/classify", async (req, res) => {
 });
 
 // ======================
-// ✅ RevenueCat Webhook (SECURE credit grants)
+// RevenueCat Webhook
 // ======================
 app.post("/revenuecat/webhook", async (req, res) => {
     try {
-        // Simple auth: set RC webhook to send: Authorization: Bearer <RC_WEBHOOK_AUTH>
         if (!CONFIG.RC_WEBHOOK_AUTH) {
             return res.status(500).json({ ok: false, error: "WEBHOOK_AUTH_NOT_CONFIGURED" });
         }
@@ -1269,25 +1248,16 @@ app.post("/revenuecat/webhook", async (req, res) => {
 
         const event = req.body || {};
         const eventId = event?.event?.id || event?.event?.event_id || event?.id || null;
-
-        // RevenueCat usually provides app_user_id
         const appUserId = event?.event?.app_user_id || event?.app_user_id || null;
-
-        // Product id can be under product_id / store_product_id depending on payload
         const productId =
             event?.event?.product_id ||
             event?.event?.store_product_id ||
             event?.product_id ||
             event?.store_product_id ||
             null;
-
-        // Type: "NON_SUBSCRIPTION_PURCHASE", "INITIAL_PURCHASE", etc
         const type = event?.event?.type || event?.type || "";
-
-        // Only care about our credit packs here
         const credits = productId ? PRODUCT_CREDITS[String(productId).trim()] : null;
 
-        // A webhook can fire multiple times, so dedupe before granting
         if (credits && appUserId) {
             const isNew = await rcDedupe(String(eventId || crypto.randomUUID()), String(appUserId), String(productId));
             if (!isNew) {
@@ -1295,12 +1265,10 @@ app.post("/revenuecat/webhook", async (req, res) => {
             }
 
             const granted = await sbGrantCredits(String(appUserId), credits);
-
             console.log("[RC WEBHOOK] credits granted", { type, appUserId, productId, credits });
             return res.json({ ok: true, granted });
         }
 
-        // If it’s not a credit product, we still return ok (webhook should not retry forever)
         console.log("[RC WEBHOOK] ignored", { type, appUserId, productId });
         return res.json({ ok: true, ignored: true });
     } catch (e) {
@@ -1309,33 +1277,34 @@ app.post("/revenuecat/webhook", async (req, res) => {
     }
 });
 
-// Login bonus for authenticated users
+// ======================
+// First-login seed for authenticated users
+// ======================
 app.post("/auth/login-bonus", async (req, res) => {
     try {
         const user = await getSupabaseUserFromBearer(req);
-        if (!user?.id) return res.status(401).json({ ok: false, error: "UNAUTHENTICATED" });
-
-        const userIdentityId = makeUserIdentityId(user.id);
-        const alreadyGranted = await bonusAlreadyGranted(user.id);
-
-        let granted = false;
-        if (!alreadyGranted) {
-            const marked = await markBonusGranted(user.id);
-            if (marked) {
-                await sbGrantCredits(userIdentityId, LOGIN_BONUS_AMOUNT);
-                granted = true;
-            }
+        if (!user?.id) {
+            return res.status(401).json({ ok: false, error: "UNAUTHENTICATED" });
         }
 
-        const s = await sbGetStatus(userIdentityId);
-        const c = await sbGetChatStatus(userIdentityId);
-        const isPro = await validateProWithRevenueCat(userIdentityId);
+        const identityId = requireIdentityId(req) || makeUserIdentityId(user.id);
+        if (!identityId || !String(identityId).startsWith("user:")) {
+            return res.status(400).json({ ok: false, error: "MISSING_OR_INVALID_IDENTITY_ID" });
+        }
+
+        const created = await sbEnsureUsageRow(identityId, {
+            proTokens: CONFIG.DEFAULT_USER_PRO_BALANCE,
+            freeChatTokens: CONFIG.DEFAULT_USER_FREE_CHAT_TOKENS,
+        });
+
+        const s = await sbGetStatus(identityId);
+        const c = await sbGetChatStatus(identityId);
+        const isPro = await validateProWithRevenueCat(identityId);
 
         return res.json({
             ok: true,
-            granted,
-            bonusAmount: granted ? LOGIN_BONUS_AMOUNT : 0,
-            identityId: userIdentityId,
+            created,
+            identityId,
             remainingPro: s.remainingPro,
             proTokens: s.proTokens,
             proUsed: s.proUsed,
@@ -1345,17 +1314,16 @@ app.post("/auth/login-bonus", async (req, res) => {
             isPro,
         });
     } catch (e) {
-        console.error("login bonus error", e);
+        console.error("auth seed error", e);
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
 
 // ======================
-// DEV-only endpoint (optional)
+// DEV-only endpoints
 // ======================
 const DEV_ADMIN_KEY = process.env.DEV_ADMIN_KEY;
 
-// Keep your dev endpoint
 app.post("/dev/set-free-chat", async (req, res) => {
     try {
         const key = req.headers["x-dev-admin-key"];
@@ -1363,18 +1331,20 @@ app.post("/dev/set-free-chat", async (req, res) => {
             return res.status(403).json({ ok: false, error: "FORBIDDEN" });
         }
 
-        const { deviceId, remaining } = req.body || {};
-        const id = typeof deviceId === "string" ? deviceId.trim() : null;
+        const id = await resolveIdentityId(req);
         if (!id) return res.status(400).json({ ok: false, error: "Missing deviceId" });
 
-        const rem = Number(remaining);
-        if (!(rem === 0 || rem === CONFIG.FREE_CHAT_TOKENS)) {
-            return res.status(400).json({ ok: false, error: `Remaining must be 0 or ${CONFIG.FREE_CHAT_TOKENS}` });
+        const rem = Number(req.body?.remaining);
+        const free_chat_tokens = String(id).startsWith("user:")
+            ? CONFIG.DEFAULT_USER_FREE_CHAT_TOKENS
+            : CONFIG.DEFAULT_GUEST_FREE_CHAT_TOKENS;
+
+        if (!(rem === 0 || rem === free_chat_tokens)) {
+            return res.status(400).json({ ok: false, error: `Remaining must be 0 or ${free_chat_tokens}` });
         }
 
-        await sbEnsureDeviceRow(id);
+        await sbEnsureIdentityRow(id);
 
-        const free_chat_tokens = CONFIG.FREE_CHAT_TOKENS;
         const free_chat_used = rem === free_chat_tokens ? 0 : free_chat_tokens;
 
         const { error } = await supabase
@@ -1399,7 +1369,6 @@ app.post("/dev/set-free-chat", async (req, res) => {
     }
 });
 
-// Optional: lock down old insecure /credits/grant (DEV ONLY)
 app.post("/credits/grant", async (req, res) => {
     try {
         const key = req.headers["x-dev-admin-key"];
@@ -1407,14 +1376,14 @@ app.post("/credits/grant", async (req, res) => {
             return res.status(403).json({ ok: false, error: "FORBIDDEN" });
         }
 
-        const deviceId = await resolveIdentityId(req);
+        const identityId = await resolveIdentityId(req);
         const productId = String(req.body?.productId || "").trim();
-        if (!deviceId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
         const amount = PRODUCT_CREDITS[productId];
         if (!amount) return res.status(400).json({ ok: false, error: "UNKNOWN_PRODUCT" });
 
-        const r = await sbGrantCredits(deviceId, amount);
+        const r = await sbGrantCredits(identityId, amount);
         return res.json({ ok: true, ...r, source: "dev-only" });
     } catch (e) {
         console.error("credits grant error", e);
@@ -1430,5 +1399,7 @@ app.listen(PORT, () => {
     if (CONFIG.PREWARM_ON_START) prewarmHotLabels();
 
     const mins = Number(CONFIG.PREWARM_CHECK_INTERVAL_MINUTES || 0);
-    if (mins > 0) setInterval(() => prewarmHotLabels(), mins * 60 * 1000);
+    if (mins > 0) {
+        setInterval(() => prewarmHotLabels(), mins * 60 * 1000);
+    }
 });
