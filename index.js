@@ -41,8 +41,8 @@ const CONFIG = {
     PREWARM_CHECK_INTERVAL_MINUTES: 60,
 
     // Guest defaults
-    DEFAULT_GUEST_PRO_BALANCE: Number(process.env.DEFAULT_GUEST_PRO_BALANCE || 1),
-    DEFAULT_GUEST_FREE_CHAT_TOKENS: Number(process.env.DEFAULT_GUEST_FREE_CHAT_TOKENS || 1),
+    DEFAULT_GUEST_PRO_BALANCE: Number(process.env.DEFAULT_GUEST_PRO_BALANCE || 5),
+    DEFAULT_GUEST_FREE_CHAT_TOKENS: Number(process.env.DEFAULT_GUEST_FREE_CHAT_TOKENS || 5),
 
     // New logged-in account defaults
     DEFAULT_USER_PRO_BALANCE: Number(process.env.DEFAULT_USER_PRO_BALANCE || 5),
@@ -332,54 +332,6 @@ async function sbEnsureIdentityRow(identityId) {
         proTokens: isUser ? CONFIG.DEFAULT_USER_PRO_BALANCE : CONFIG.DEFAULT_GUEST_PRO_BALANCE,
         freeChatTokens: isUser ? CONFIG.DEFAULT_USER_FREE_CHAT_TOKENS : CONFIG.DEFAULT_GUEST_FREE_CHAT_TOKENS,
     });
-}
-
-// ======================
-// Free-chat helpers
-// ======================
-async function sbGetChatStatus(identityId) {
-    await sbEnsureIdentityRow(identityId);
-
-    const { data, error } = await supabase
-        .from("device_usage")
-        .select("device_id, free_chat_tokens, free_chat_used")
-        .eq("device_id", identityId)
-        .maybeSingle();
-
-    if (error) throw error;
-
-    const fallback = String(identityId).startsWith("user:")
-        ? CONFIG.DEFAULT_USER_FREE_CHAT_TOKENS
-        : CONFIG.DEFAULT_GUEST_FREE_CHAT_TOKENS;
-
-    return {
-        freeChatTokens: data?.free_chat_tokens ?? fallback,
-        freeChatUsed: data?.free_chat_used ?? 0,
-        remainingFreeChat: Math.max(0, (data?.free_chat_tokens ?? fallback) - (data?.free_chat_used ?? 0)),
-    };
-}
-
-async function sbConsumeFreeChat(identityId) {
-    await sbEnsureIdentityRow(identityId);
-
-    const fallback = String(identityId).startsWith("user:")
-        ? CONFIG.DEFAULT_USER_FREE_CHAT_TOKENS
-        : CONFIG.DEFAULT_GUEST_FREE_CHAT_TOKENS;
-
-    const { data, error } = await supabase.rpc("consume_free_chat", {
-        p_device_id: identityId,
-        p_default_seed: fallback,
-    });
-
-    if (error) throw error;
-
-    const row = Array.isArray(data) ? data[0] : data;
-    return {
-        ok: !!row.ok,
-        freeChatTokens: row.free_chat_tokens,
-        freeChatUsed: row.free_chat_used,
-        remainingFreeChat: row.remaining_free_chat,
-    };
 }
 
 // ======================
@@ -916,13 +868,15 @@ app.post("/status", async (req, res) => {
 
         return res.json({
             ok: true,
+
+            creditsRemaining: s.remainingPro,
+            creditsTotal: s.proTokens,
+            creditsUsed: s.proUsed,
+
+            // legacy fields kept temporarily for compatibility
             remainingPro: s.remainingPro,
             proTokens: s.proTokens,
             proUsed: s.proUsed,
-
-            remainingFreeChat: c.remainingFreeChat,
-            freeChatTokens: c.freeChatTokens,
-            freeChatUsed: c.freeChatUsed,
 
             isPro,
             source: "supabase+revenuecat",
@@ -943,19 +897,19 @@ app.post("/ask", async (req, res) => {
         if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
         const isPro = await validateProWithRevenueCat(identityId);
-        let gate = null;
+        let spend = null;
 
         if (!isPro) {
-            gate = await sbConsumeFreeChat(identityId);
-            timings.free_chat_gate = gate;
+            spend = await sbSpendCredits(identityId, 1);
+            timings.shared_credit_gate = spend;
 
-            if (!gate.ok) {
+            if (!spend.ok) {
                 return res.status(402).json({
                     ok: false,
-                    error: "FREE_CHAT_LIMIT_REACHED",
-                    freeChatTokens: gate.freeChatTokens,
-                    freeChatUsed: gate.freeChatUsed,
-                    remainingFreeChat: gate.remainingFreeChat,
+                    error: "NO_CREDITS",
+                    creditsRemaining: spend.remainingPro ?? 0,
+                    creditsTotal: spend.proTokens ?? 0,
+                    creditsUsed: spend.proUsed ?? 0,
                     requiresSubscription: true,
                     isPro: false,
                     ms: Date.now() - t0,
@@ -963,7 +917,7 @@ app.post("/ask", async (req, res) => {
                 });
             }
         } else {
-            timings.free_chat_gate = "skipped:pro";
+            timings.shared_credit_gate = "skipped:pro";
         }
 
         const { imageDataUrl, question, pet, history } = req.body || {};
@@ -998,6 +952,9 @@ app.post("/ask", async (req, res) => {
                 answer: "I can’t tell what I’m looking at… so I’ll just assume you’re wrong. 👀",
                 label: "unknown",
                 isPro,
+                creditsRemaining: !isPro ? spend?.remainingPro ?? null : null,
+                creditsTotal: !isPro ? spend?.proTokens ?? null : null,
+                creditsUsed: !isPro ? spend?.proUsed ?? null : null,
                 ms: Date.now() - t0,
                 timings,
             });
@@ -1014,6 +971,7 @@ app.post("/ask", async (req, res) => {
             genMs: Date.now() - tGen,
             totalMs: Date.now() - t0,
             history: safeHistory.length,
+            remainingCredits: spend?.remainingPro,
         });
 
         return res.json({
@@ -1021,6 +979,9 @@ app.post("/ask", async (req, res) => {
             answer,
             tier: isPro ? "pro" : "free",
             isPro,
+            creditsRemaining: !isPro ? spend?.remainingPro ?? null : null,
+            creditsTotal: !isPro ? spend?.proTokens ?? null : null,
+            creditsUsed: !isPro ? spend?.proUsed ?? null : null,
             ms: Date.now() - t0,
             timings,
         });
@@ -1298,7 +1259,6 @@ app.post("/auth/login-bonus", async (req, res) => {
         });
 
         const s = await sbGetStatus(identityId);
-        const c = await sbGetChatStatus(identityId);
         const isPro = await validateProWithRevenueCat(identityId);
 
         return res.json({
