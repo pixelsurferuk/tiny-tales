@@ -1159,10 +1159,20 @@ app.post("/thought", async (req, res) => {
             tier: "pro",
             label,
             enrich,
+
+            creditsRemaining: spend.remainingPro,
+            creditsTotal: spend.proTokens,
+            creditsUsed: spend.proUsed,
+
+            // legacy
             remainingPro: spend.remainingPro,
+            proTokens: spend.proTokens,
+            proUsed: spend.proUsed,
+
             ms: Date.now() - t0,
             timings,
         });
+
     } catch (e) {
         console.error("Server error in /thought:", e);
         return res.status(500).json({ ok: false, error: "SERVER_ERROR", ms: Date.now() - t0, timings });
@@ -1370,7 +1380,7 @@ const PORT = process.env.PORT || 8787;
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
-
+    prewarmHotLabels();
     if (CONFIG.PREWARM_ON_START) prewarmHotLabels();
 
     const mins = Number(CONFIG.PREWARM_CHECK_INTERVAL_MINUTES || 0);
