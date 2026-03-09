@@ -863,7 +863,6 @@ app.post("/status", async (req, res) => {
         if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
         const s = await sbGetStatus(identityId);
-        const c = await sbGetChatStatus(identityId);
         const isPro = await validateProWithRevenueCat(identityId);
 
         return res.json({
@@ -1265,12 +1264,16 @@ app.post("/auth/login-bonus", async (req, res) => {
             ok: true,
             created,
             identityId,
+
+            creditsRemaining: s.remainingPro,
+            creditsTotal: s.proTokens,
+            creditsUsed: s.proUsed,
+
+            // legacy compatibility
             remainingPro: s.remainingPro,
             proTokens: s.proTokens,
             proUsed: s.proUsed,
-            remainingFreeChat: c.remainingFreeChat,
-            freeChatTokens: c.freeChatTokens,
-            freeChatUsed: c.freeChatUsed,
+
             isPro,
         });
     } catch (e) {
