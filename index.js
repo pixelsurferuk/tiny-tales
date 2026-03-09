@@ -1,4 +1,3 @@
-// server/index.js
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -58,6 +57,13 @@ const CONFIG = {
     RC_WEBHOOK_AUTH: process.env.RC_WEBHOOK_AUTH || "",
     RC_CACHE_TTL_MS: 60 * 1000,
 };
+
+// TEMPORARY MASTER SWITCH
+// While false:
+// - nobody is treated as Pro on the server
+// - /ask will always spend shared credits
+// - /status will always report isPro: false
+const SUBSCRIPTIONS_ENABLED = false;
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -317,13 +323,6 @@ async function sbEnsureUsageRow(identityId, { proTokens, freeChatTokens }) {
 
     if (insErr) throw insErr;
     return true;
-}
-
-async function sbEnsureDeviceRow(deviceId) {
-    return sbEnsureUsageRow(deviceId, {
-        proTokens: CONFIG.DEFAULT_GUEST_PRO_BALANCE,
-        freeChatTokens: CONFIG.DEFAULT_GUEST_FREE_CHAT_TOKENS,
-    });
 }
 
 async function sbEnsureIdentityRow(identityId) {
@@ -758,7 +757,7 @@ Sometimes end with exactly ONE fitting emoji.`,
 }
 
 // ======================
-// Pro credits helpers
+// Shared credits helpers
 // ======================
 async function sbGetStatus(identityId) {
     await sbEnsureIdentityRow(identityId);
@@ -794,12 +793,13 @@ async function sbSpendCredits(identityId, cost) {
     });
 
     if (error) throw error;
+
     const row = Array.isArray(data) ? data[0] : data;
     return {
-        ok: !!row.ok,
-        proTokens: row.pro_tokens,
-        proUsed: row.pro_used,
-        remainingPro: row.remaining_pro,
+        ok: !!row?.ok,
+        proTokens: row?.pro_tokens ?? fallback,
+        proUsed: row?.pro_used ?? 0,
+        remainingPro: row?.remaining_pro ?? fallback,
     };
 }
 
@@ -815,11 +815,12 @@ async function sbGrantCredits(identityId, amount) {
     });
 
     if (error) throw error;
+
     const row = Array.isArray(data) ? data[0] : data;
     return {
-        proTokens: row.pro_tokens,
-        proUsed: row.pro_used,
-        remainingPro: row.remaining_pro,
+        proTokens: row?.pro_tokens ?? fallback,
+        proUsed: row?.pro_used ?? 0,
+        remainingPro: row?.remaining_pro ?? fallback,
     };
 }
 
@@ -863,7 +864,7 @@ app.post("/status", async (req, res) => {
         if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
         const s = await sbGetStatus(identityId);
-        const isPro = await validateProWithRevenueCat(identityId);
+        const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
 
         return res.json({
             ok: true,
@@ -895,12 +896,22 @@ app.post("/ask", async (req, res) => {
         const identityId = await resolveIdentityId(req);
         if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
 
-        const isPro = await validateProWithRevenueCat(identityId);
+        const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
+
+        console.log("[ASK PRO CHECK]", { identityId, isPro });
+
         let spend = null;
 
         if (!isPro) {
+            console.log("[ASK BEFORE SPEND]", { identityId, isPro });
+
             spend = await sbSpendCredits(identityId, 1);
             timings.shared_credit_gate = spend;
+
+            console.log("[ASK SPEND RESULT]", { identityId, spend });
+
+            const check = await sbGetStatus(identityId);
+            console.log("[ASK STATUS AFTER SPEND]", { identityId, check });
 
             if (!spend.ok) {
                 return res.status(402).json({
@@ -917,6 +928,7 @@ app.post("/ask", async (req, res) => {
             }
         } else {
             timings.shared_credit_gate = "skipped:pro";
+            console.log("[ASK SKIPPED SPEND BECAUSE PRO]", { identityId });
         }
 
         const { imageDataUrl, question, pet, history } = req.body || {};
@@ -1258,7 +1270,7 @@ app.post("/auth/login-bonus", async (req, res) => {
         });
 
         const s = await sbGetStatus(identityId);
-        const isPro = await validateProWithRevenueCat(identityId);
+        const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
 
         return res.json({
             ok: true,
