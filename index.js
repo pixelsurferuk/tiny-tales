@@ -39,11 +39,9 @@ const CONFIG = {
     PREWARM_ON_START: false,
     PREWARM_CHECK_INTERVAL_MINUTES: 60,
 
-    // Guest defaults
     DEFAULT_GUEST_PRO_BALANCE: Number(process.env.DEFAULT_GUEST_PRO_BALANCE || 5),
     DEFAULT_GUEST_FREE_CHAT_TOKENS: Number(process.env.DEFAULT_GUEST_FREE_CHAT_TOKENS || 5),
 
-    // New logged-in account defaults
     DEFAULT_USER_PRO_BALANCE: Number(process.env.DEFAULT_USER_PRO_BALANCE || 5),
     DEFAULT_USER_FREE_CHAT_TOKENS: Number(process.env.DEFAULT_USER_FREE_CHAT_TOKENS || 5),
 
@@ -58,12 +56,7 @@ const CONFIG = {
     RC_CACHE_TTL_MS: 60 * 1000,
 };
 
-// TEMPORARY MASTER SWITCH
-// While false:
-// - nobody is treated as Pro on the server
-// - /ask will always spend shared credits
-// - /status will always report isPro: false
-const SUBSCRIPTIONS_ENABLED = false;
+const SUBSCRIPTIONS_ENABLED = true;
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -91,10 +84,7 @@ function requireIdentityId(req) {
 
 function isValidIdentityId(value) {
     const v = String(value || "").trim();
-    return (
-        v.startsWith("user:") ||
-        v.startsWith("guest_")
-    );
+    return v.startsWith("user:") || v.startsWith("guest_");
 }
 
 async function resolveIdentityId(req) {
@@ -862,7 +852,7 @@ async function rcDedupe(eventId, appUserId, productId) {
 }
 
 // ======================
-// Reward for watching video add
+// Reward for watching video ad
 // ======================
 app.post("/ads/reward-credit", async (req, res) => {
     try {
@@ -926,7 +916,6 @@ app.post("/status", async (req, res) => {
             creditsTotal: s.proTokens,
             creditsUsed: s.proUsed,
 
-            // legacy fields kept temporarily for compatibility
             remainingPro: s.remainingPro,
             proTokens: s.proTokens,
             proUsed: s.proUsed,
@@ -1177,26 +1166,44 @@ app.post("/thought", async (req, res) => {
         }
 
         const identityId = await resolveIdentityId(req);
-        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+        if (!identityId) {
+            return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+        }
 
-        const tSpend = Date.now();
-        const spend = await sbSpendCredits(identityId, 1);
-        timings.credits_spend_done = Date.now() - t0;
+        const isSubscribedPro =
+            SUBSCRIPTIONS_ENABLED && await validateProWithRevenueCat(identityId);
 
-        console.log("[THOUGHT] spend", {
-            rid,
-            ok: spend.ok,
-            ms: Date.now() - tSpend,
-            remainingPro: spend.remainingPro,
-        });
+        let spend = null;
 
-        if (!spend.ok) {
-            return res.json({
-                ok: false,
-                error: "PRO_LIMIT_REACHED",
-                remainingPro: spend.remainingPro ?? 0,
-                ms: Date.now() - t0,
-                timings,
+        if (!isSubscribedPro) {
+            const tSpend = Date.now();
+            spend = await sbSpendCredits(identityId, 1);
+            timings.credits_spend_done = Date.now() - t0;
+
+            console.log("[THOUGHT] spend", {
+                rid,
+                ok: spend.ok,
+                ms: Date.now() - tSpend,
+                remainingPro: spend.remainingPro,
+                isSubscribedPro,
+            });
+
+            if (!spend.ok) {
+                return res.json({
+                    ok: false,
+                    error: "PRO_LIMIT_REACHED",
+                    remainingPro: spend.remainingPro ?? 0,
+                    ms: Date.now() - t0,
+                    timings,
+                });
+            }
+        } else {
+            timings.credits_spend_done = "skipped:subscribed_pro";
+
+            console.log("[THOUGHT] spend skipped for subscribed pro", {
+                rid,
+                identityId,
+                isSubscribedPro,
             });
         }
 
@@ -1213,19 +1220,17 @@ app.post("/thought", async (req, res) => {
             label,
             enrich,
 
-            creditsRemaining: spend.remainingPro,
-            creditsTotal: spend.proTokens,
-            creditsUsed: spend.proUsed,
+            creditsRemaining: spend?.remainingPro ?? null,
+            creditsTotal: spend?.proTokens ?? null,
+            creditsUsed: spend?.proUsed ?? null,
 
-            // legacy
-            remainingPro: spend.remainingPro,
-            proTokens: spend.proTokens,
-            proUsed: spend.proUsed,
+            remainingPro: spend?.remainingPro ?? null,
+            proTokens: spend?.proTokens ?? null,
+            proUsed: spend?.proUsed ?? null,
 
             ms: Date.now() - t0,
             timings,
         });
-
     } catch (e) {
         console.error("Server error in /thought:", e);
         return res.status(500).json({ ok: false, error: "SERVER_ERROR", ms: Date.now() - t0, timings });
@@ -1344,7 +1349,6 @@ app.post("/auth/login-bonus", async (req, res) => {
             creditsTotal: s.proTokens,
             creditsUsed: s.proUsed,
 
-            // legacy compatibility
             remainingPro: s.remainingPro,
             proTokens: s.proTokens,
             proUsed: s.proUsed,
