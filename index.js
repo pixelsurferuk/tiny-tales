@@ -854,6 +854,54 @@ async function rcDedupe(eventId, appUserId, productId) {
 }
 
 // ======================
+// Reward for watching video add
+// ======================
+app.post("/ads/reward-credit", async (req, res) => {
+    try {
+        const identityId =
+            typeof req.body?.identityId === "string" && req.body.identityId.trim()
+                ? req.body.identityId.trim()
+                : typeof req.body?.userId === "string" && req.body.userId.trim()
+                    ? req.body.userId.trim()
+                    : null;
+
+        if (!identityId) {
+            return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
+        }
+
+        const amount = Math.max(1, Number(req.body?.amount) || 1);
+        const source = String(req.body?.source || "paywall").trim();
+
+        const granted = await sbGrantCredits(identityId, amount);
+
+        console.log("[ADS REWARD CREDIT]", {
+            identityId,
+            amount,
+            source,
+            remainingPro: granted.remainingPro,
+            proTokens: granted.proTokens,
+            proUsed: granted.proUsed,
+        });
+
+        return res.json({
+            ok: true,
+            source,
+            creditsRemaining: granted.remainingPro,
+            creditsTotal: granted.proTokens,
+            creditsUsed: granted.proUsed,
+
+            // legacy compatibility
+            remainingPro: granted.remainingPro,
+            proTokens: granted.proTokens,
+            proUsed: granted.proUsed,
+        });
+    } catch (e) {
+        console.error("reward credit error", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    }
+});
+
+// ======================
 // Routes
 // ======================
 app.get("/health", (req, res) => res.json({ ok: true }));
