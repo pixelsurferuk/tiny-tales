@@ -1426,7 +1426,6 @@ app.post("/credits/grant", async (req, res) => {
 
 const PORT = process.env.PORT || 8787;
 
-/*
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 
@@ -1436,4 +1435,4 @@ app.listen(PORT, () => {
     if (mins > 0) {
         setInterval(() => prewarmHotLabels(), mins * 60 * 1000);
     }
-});*/
+});
