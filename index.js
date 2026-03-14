@@ -34,9 +34,9 @@ const CONFIG = {
     CLASSIFY_MODEL: "gpt-4o-mini",
     THOUGHT_MODEL: "gpt-4o-mini",
 
-    PREWARM_ENABLED: true,
+    PREWARM_ENABLED: false,
     PREWARM_LABELS: ["man", "woman", "dog", "cat", "rabbit", "hamster", "fish", "bird", "horse"],
-    PREWARM_ON_START: true,
+    PREWARM_ON_START: false,
     PREWARM_CHECK_INTERVAL_MINUTES: 60,
 
     // Guest defaults
