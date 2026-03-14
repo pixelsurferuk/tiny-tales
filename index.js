@@ -89,6 +89,14 @@ function requireIdentityId(req) {
     return trimmed;
 }
 
+function isValidIdentityId(value) {
+    const v = String(value || "").trim();
+    return (
+        v.startsWith("user:") ||
+        v.startsWith("guest_")
+    );
+}
+
 async function resolveIdentityId(req) {
     const explicit = requireIdentityId(req);
     if (explicit) return explicit;
@@ -858,15 +866,14 @@ async function rcDedupe(eventId, appUserId, productId) {
 // ======================
 app.post("/ads/reward-credit", async (req, res) => {
     try {
-        const identityId =
-            typeof req.body?.identityId === "string" && req.body.identityId.trim()
-                ? req.body.identityId.trim()
-                : typeof req.body?.userId === "string" && req.body.userId.trim()
-                    ? req.body.userId.trim()
-                    : null;
+        const identityId = await resolveIdentityId(req);
 
         if (!identityId) {
             return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
+        }
+
+        if (!isValidIdentityId(identityId)) {
+            return res.status(400).json({ ok: false, error: "INVALID_IDENTITY_ID" });
         }
 
         const amount = Math.max(1, Number(req.body?.amount) || 1);
@@ -889,8 +896,6 @@ app.post("/ads/reward-credit", async (req, res) => {
             creditsRemaining: granted.remainingPro,
             creditsTotal: granted.proTokens,
             creditsUsed: granted.proUsed,
-
-            // legacy compatibility
             remainingPro: granted.remainingPro,
             proTokens: granted.proTokens,
             proUsed: granted.proUsed,
