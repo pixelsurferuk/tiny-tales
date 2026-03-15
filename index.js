@@ -34,6 +34,8 @@ const CONFIG = {
     RC_ENTITLEMENT_ID: process.env.RC_ENTITLEMENT_ID || "pro_access",
     RC_WEBHOOK_AUTH: process.env.RC_WEBHOOK_AUTH || "",
     RC_CACHE_TTL_MS: 60 * 1000,
+
+    FORCE_NOT_PRO: process.env.FORCE_NOT_PRO === "true",
 };
 
 const SUBSCRIPTIONS_ENABLED = true;
@@ -125,6 +127,7 @@ async function getSupabaseUserFromBearer(req) {
 // ─── RevenueCat ───────────────────────────────────────────────────────────────
 
 async function validateProWithRevenueCat(appUserID) {
+    if (CONFIG.FORCE_NOT_PRO) return false;
     if (!REVENUECAT_SECRET_KEY) return false;
 
     const cached = rcCache.get(appUserID);
