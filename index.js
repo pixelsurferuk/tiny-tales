@@ -13,37 +13,17 @@ app.use(express.json({ limit: "20mb" }));
 // 🔧 CONFIG
 // ======================
 const CONFIG = {
-    BANK_DAILY_SIZE: 100,
-    BANK_LEARN_BATCH_SIZE: 25,
-    BANK_LEARN_MIN_ACCEPT: 30,
-
-    FREE_THOUGHT_MIN_WORDS: 5,
-    FREE_THOUGHT_MAX_WORDS: 15,
-
     PRO_THOUGHT_MIN_WORDS: 10,
     PRO_THOUGHT_MAX_WORDS: 35,
 
     ASK_MIN_WORDS: 10,
     ASK_MAX_WORDS: 35,
 
-    RELAX_1_DELTA_MIN_WORDS: 2,
-    RELAX_1_DELTA_MAX_WORDS: 4,
-    RELAX_2_DELTA_MIN_WORDS: 3,
-    RELAX_2_DELTA_MAX_WORDS: 8,
-
     CLASSIFY_MODEL: "gpt-4o-mini",
     THOUGHT_MODEL: "gpt-4o-mini",
 
-    PREWARM_ENABLED: false,
-    PREWARM_LABELS: ["man", "woman", "dog", "cat", "rabbit", "hamster", "fish", "bird", "horse"],
-    PREWARM_ON_START: false,
-    PREWARM_CHECK_INTERVAL_MINUTES: 60,
-
     DEFAULT_GUEST_PRO_BALANCE: Number(process.env.DEFAULT_GUEST_PRO_BALANCE || 5),
-    DEFAULT_GUEST_FREE_CHAT_TOKENS: Number(process.env.DEFAULT_GUEST_FREE_CHAT_TOKENS || 5),
-
     DEFAULT_USER_PRO_BALANCE: Number(process.env.DEFAULT_USER_PRO_BALANCE || 5),
-    DEFAULT_USER_FREE_CHAT_TOKENS: Number(process.env.DEFAULT_USER_FREE_CHAT_TOKENS || 5),
 
     SUBJECT_CACHE_TTL_MS: 10 * 60 * 1000,
     SUBJECT_CACHE_MAX: 2000,
@@ -57,14 +37,37 @@ const CONFIG = {
 };
 
 const SUBSCRIPTIONS_ENABLED = true;
-
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// ======================
-// Supabase
-// ======================
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const REVENUECAT_SECRET_KEY = process.env.REVENUECAT_SECRET_KEY;
+const DEV_ADMIN_KEY = process.env.DEV_ADMIN_KEY;
+const PORT = process.env.PORT || 8787;
+
+const rcCache = new Map();
+const subjectCache = new Map();
+
+const utcDayKey = () => new Date().toISOString().slice(0, 10);
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const cleanLabel = (l) => String(l || "").trim().toLowerCase();
+const isValidLabel = (l) => /^[a-z]{2,24}$/.test(l);
+
+const LABEL_ALIASES = {
+    budgie: "parrot",
+    parakeet: "parrot",
+    canary: "bird",
+    kitten: "cat",
+    puppy: "dog",
+    guineapig: "guinea",
+    guinea_pig: "guinea",
+};
+
+const PRODUCT_CREDITS = {
+    "10_smart_thoughts": 10,
+    "25_smart_thoughts": 25,
+    "50_smart_thoughts": 50,
+    "100_smart_thoughts": 100,
+};
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     console.warn("⚠️ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY. Supabase endpoints will fail.");
@@ -73,6 +76,8 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL || "http://invalid", SUPABASE_SERVICE_ROLE_KEY || "invalid", {
     auth: { persistSession: false },
 });
+
+// ─── Identity helpers ─────────────────────────────────────────────────────────
 
 function requireIdentityId(req) {
     const id = req.body?.identityId ?? req.body?.deviceId;
@@ -97,44 +102,33 @@ async function resolveIdentityId(req) {
     return null;
 }
 
-function makeDeviceIdentityId(deviceId) {
-    const id = String(deviceId || "").trim();
-    if (!id) return null;
-    return id.startsWith("guest_") ? id : `guest_${id}`;
-}
-
 function makeUserIdentityId(userId) {
     const id = String(userId || "").trim();
     if (!id) return null;
     return id.startsWith("user:") ? id : `user:${id}`;
 }
 
-function jwtRole(key) {
-    try {
-        const payload = key.split(".")[1];
-        const json = Buffer.from(payload, "base64").toString("utf8");
-        const parsed = JSON.parse(json);
-        return parsed.role || parsed.aud;
-    } catch {
-        return "unreadable";
-    }
+// ─── Auth helpers ─────────────────────────────────────────────────────────────
+
+async function getSupabaseUserFromBearer(req) {
+    const auth = String(req.headers?.authorization || "").trim();
+    if (!auth.toLowerCase().startsWith("bearer ")) return null;
+
+    const token = auth.slice(7).trim();
+    if (!token) return null;
+
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) return null;
+    return data.user;
 }
 
-console.log("SUPABASE key role:", jwtRole(process.env.SUPABASE_SERVICE_ROLE_KEY || ""));
-
-// ======================
-// RevenueCat server-side validation
-// ======================
-const REVENUECAT_SECRET_KEY = process.env.REVENUECAT_SECRET_KEY;
-const rcCache = new Map();
+// ─── RevenueCat ───────────────────────────────────────────────────────────────
 
 async function validateProWithRevenueCat(appUserID) {
     if (!REVENUECAT_SECRET_KEY) return false;
 
     const cached = rcCache.get(appUserID);
-    if (cached && Date.now() < cached.expiresAtMs) {
-        return cached.isPro;
-    }
+    if (cached && Date.now() < cached.expiresAtMs) return cached.isPro;
 
     try {
         const r = await fetch(`https://api.revenuecat.com/v1/subscribers/${encodeURIComponent(appUserID)}`, {
@@ -170,35 +164,7 @@ async function validateProWithRevenueCat(appUserID) {
     }
 }
 
-async function getSupabaseUserFromBearer(req) {
-    const auth = String(req.headers?.authorization || "").trim();
-    if (!auth.toLowerCase().startsWith("bearer ")) return null;
-
-    const token = auth.slice(7).trim();
-    if (!token) return null;
-
-    const { data, error } = await supabase.auth.getUser(token);
-    if (error || !data?.user) return null;
-    return data.user;
-}
-
-// ======================
-// Helpers
-// ======================
-const utcDayKey = () => new Date().toISOString().slice(0, 10);
-const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
-const cleanLabel = (l) => String(l || "").trim().toLowerCase();
-const isValidLabel = (l) => /^[a-z]{2,24}$/.test(l);
-
-const LABEL_ALIASES = {
-    budgie: "parrot",
-    parakeet: "parrot",
-    canary: "bird",
-    kitten: "cat",
-    puppy: "dog",
-    guineapig: "guinea",
-    guinea_pig: "guinea",
-};
+// ─── Label helpers ────────────────────────────────────────────────────────────
 
 function normalizeLabel(label) {
     const l = cleanLabel(label);
@@ -215,17 +181,6 @@ function wordCount(str) {
     return s.split(/\s+/).filter(Boolean).length;
 }
 
-function normalizeThoughtLines(text, { minWords, maxWords }) {
-    return String(text)
-        .split("\n")
-        .map((t) => stripLinePrefix(t))
-        .filter(Boolean)
-        .filter((t) => {
-            const wc = wordCount(t);
-            return wc >= minWords && wc <= maxWords;
-        });
-}
-
 function ensureSingleEndingEmoji(text) {
     const t = String(text || "").trim();
     if (!t) return t;
@@ -234,47 +189,7 @@ function ensureSingleEndingEmoji(text) {
     return `${t} 🙂`;
 }
 
-function getRelaxedRanges(minWords, maxWords) {
-    const r1 = {
-        minWords: Math.max(1, minWords - CONFIG.RELAX_1_DELTA_MIN_WORDS),
-        maxWords: Math.max(minWords, maxWords + CONFIG.RELAX_1_DELTA_MAX_WORDS),
-    };
-    const r2 = {
-        minWords: Math.max(1, minWords - CONFIG.RELAX_2_DELTA_MIN_WORDS),
-        maxWords: Math.max(minWords, maxWords + CONFIG.RELAX_2_DELTA_MAX_WORDS),
-    };
-    return { r1, r2 };
-}
-
-function filterWithAutoRelax(text, { minWords, maxWords, labelForLogs = "unknown" }) {
-    let lines = normalizeThoughtLines(text, { minWords, maxWords });
-    if (lines.length >= 8) return { lines, mode: "strict" };
-
-    const { r1, r2 } = getRelaxedRanges(minWords, maxWords);
-
-    const relaxed1 = normalizeThoughtLines(text, r1);
-    if (relaxed1.length >= 8) {
-        console.warn(
-            `⚠️ Auto-relax (level 1) used for '${labelForLogs}' batch: ${minWords}-${maxWords} → ${r1.minWords}-${r1.maxWords}`
-        );
-        return { lines: relaxed1, mode: "relax1" };
-    }
-
-    const relaxed2 = normalizeThoughtLines(text, r2);
-    if (relaxed2.length) {
-        console.warn(
-            `⚠️ Auto-relax (level 2) used for '${labelForLogs}' batch: ${minWords}-${maxWords} → ${r2.minWords}-${r2.maxWords}`
-        );
-        return { lines: relaxed2, mode: "relax2" };
-    }
-
-    return { lines, mode: "strict-empty" };
-}
-
-// ======================
-// Subject-only cache
-// ======================
-const subjectCache = new Map();
+// ─── Subject cache ────────────────────────────────────────────────────────────
 
 function subjectCacheKey(imageDataUrl) {
     return crypto.createHash("sha1").update(String(imageDataUrl || "")).digest("hex");
@@ -298,10 +213,36 @@ function subjectCacheSet(key, value) {
     subjectCache.set(key, value);
 }
 
-// ======================
-// Usage row helpers
-// ======================
-async function sbEnsureUsageRow(identityId, { proTokens, freeChatTokens }) {
+// ─── Hardware fingerprint helpers ─────────────────────────────────────────────
+
+function extractHardwareFingerprint(identityId) {
+    const id = String(identityId || "");
+    if (!id.startsWith("guest_")) return null;
+    const fp = id.slice(6);
+    return fp.length >= 8 ? fp : null;
+}
+
+async function sbHasSeenHardwareId(hardwareId) {
+    if (!hardwareId) return false;
+
+    const { data, error } = await supabase
+        .from("device_usage")
+        .select("device_id")
+        .eq("hardware_id", hardwareId)
+        .limit(1)
+        .maybeSingle();
+
+    if (error) {
+        console.warn("[hardware_id] lookup failed:", error.message);
+        return false;
+    }
+
+    return !!data;
+}
+
+// ─── Usage row helpers ────────────────────────────────────────────────────────
+
+async function sbEnsureUsageRow(identityId, { tokens }) {
     const { data, error } = await supabase
         .from("device_usage")
         .select("device_id")
@@ -311,12 +252,18 @@ async function sbEnsureUsageRow(identityId, { proTokens, freeChatTokens }) {
     if (error) throw error;
     if (data) return false;
 
+    const hardwareId = extractHardwareFingerprint(identityId);
+    const alreadyClaimed = await sbHasSeenHardwareId(hardwareId);
+
+    if (alreadyClaimed) {
+        console.log("[sbEnsureUsageRow] hardware already claimed — granting 0", { identityId, hardwareId });
+    }
+
     const { error: insErr } = await supabase.from("device_usage").insert({
         device_id: identityId,
-        pro_tokens: proTokens,
-        pro_used: 0,
-        free_chat_tokens: freeChatTokens,
-        free_chat_used: 0,
+        hardware_id: hardwareId || null,
+        tokens: alreadyClaimed ? 0 : tokens,
+        tokens_used: 0,
     });
 
     if (insErr) throw insErr;
@@ -326,182 +273,98 @@ async function sbEnsureUsageRow(identityId, { proTokens, freeChatTokens }) {
 async function sbEnsureIdentityRow(identityId) {
     const isUser = String(identityId).startsWith("user:");
     return sbEnsureUsageRow(identityId, {
-        proTokens: isUser ? CONFIG.DEFAULT_USER_PRO_BALANCE : CONFIG.DEFAULT_GUEST_PRO_BALANCE,
-        freeChatTokens: isUser ? CONFIG.DEFAULT_USER_FREE_CHAT_TOKENS : CONFIG.DEFAULT_GUEST_FREE_CHAT_TOKENS,
+        tokens: isUser ? CONFIG.DEFAULT_USER_PRO_BALANCE : CONFIG.DEFAULT_GUEST_PRO_BALANCE,
     });
 }
 
-// ======================
-// Thought bank helpers
-// ======================
-async function sbGetBankByDate(label, bankDate) {
-    const { data, error } = await supabase
-        .from("thought_banks")
-        .select("thoughts, bank_date")
-        .eq("label", label)
-        .eq("bank_date", bankDate)
+// ─── Credits helpers ──────────────────────────────────────────────────────────
+
+async function sbGetStatus(identityId) {
+    await sbEnsureIdentityRow(identityId);
+
+    const { data: existing, error: selErr } = await supabase
+        .from("device_usage")
+        .select("device_id, tokens, tokens_used")
+        .eq("device_id", identityId)
         .maybeSingle();
 
-    if (error) throw error;
+    if (selErr) throw selErr;
 
-    const thoughts = data?.thoughts;
-    if (!Array.isArray(thoughts) || thoughts.length === 0) return null;
+    const fallback = String(identityId).startsWith("user:")
+        ? CONFIG.DEFAULT_USER_PRO_BALANCE
+        : CONFIG.DEFAULT_GUEST_PRO_BALANCE;
 
-    return thoughts
-        .filter((t) => typeof t === "string")
-        .map((t) => t.trim())
-        .filter(Boolean);
+    return {
+        proTokens: existing?.tokens ?? fallback,
+        proUsed: existing?.tokens_used ?? 0,
+        remainingPro: Math.max(0, (existing?.tokens ?? fallback) - (existing?.tokens_used ?? 0)),
+    };
 }
 
-async function sbGetTodaysBank(label) {
-    return sbGetBankByDate(label, utcDayKey());
-}
+async function sbSpendCredits(identityId, cost) {
+    const fallback = String(identityId).startsWith("user:")
+        ? CONFIG.DEFAULT_USER_PRO_BALANCE
+        : CONFIG.DEFAULT_GUEST_PRO_BALANCE;
 
-async function sbGetLatestBank(label) {
-    const { data, error } = await supabase
-        .from("thought_banks")
-        .select("thoughts, bank_date")
-        .eq("label", label)
-        .order("bank_date", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-    if (error) throw error;
-
-    const thoughts = data?.thoughts;
-    if (!Array.isArray(thoughts) || thoughts.length === 0) return null;
-
-    return thoughts
-        .filter((t) => typeof t === "string")
-        .map((t) => t.trim())
-        .filter(Boolean);
-}
-
-async function sbUpsertBank(label, thoughts) {
-    const bankDate = utcDayKey();
-
-    const cleanThoughts = (thoughts || [])
-        .filter((t) => typeof t === "string")
-        .map((t) => t.trim())
-        .filter(Boolean);
-
-    const { error } = await supabase
-        .from("thought_banks")
-        .upsert({ label, bank_date: bankDate, thoughts: cleanThoughts }, { onConflict: "label,bank_date" });
-
-    if (error) throw error;
-}
-
-// ======================
-// Generation (Free bank)
-// ======================
-async function generateThoughtBatch(label, count) {
-    const minW = CONFIG.FREE_THOUGHT_MIN_WORDS;
-    const maxW = CONFIG.FREE_THOUGHT_MAX_WORDS;
-
-    const resp = await client.responses.create({
-        model: CONFIG.THOUGHT_MODEL,
-        input: [
-            {
-                role: "system",
-                content:
-                    "You write funny, family-friendly inner thoughts for a camera app. " +
-                    "IMPORTANT: Thoughts MUST be in first-person as the subject in the image (the character). " +
-                    "Use 'I/me/my' language. Never write as a narrator or a human observing a photo. " +
-                    "Do NOT mention 'photo', 'picture', 'camera', 'app', 'user', 'viewer'. " +
-                    "Use UK humour and UK wording (mates, cheeky, faff, sorted, etc) but keep it widely understandable. " +
-                    "No hate, no sexual content, no slurs, no profanity. " +
-                    "One thought per line. Avoid numbering/bullets. " +
-                    "IMPORTANT: End the thought with exactly ONE fitting emoji at the very end. Do not add emojis elsewhere.",
-            },
-            {
-                role: "user",
-                content:
-                    `Character: a ${label}\n` +
-                    `Write ${count} funny inner thoughts as that character.\n` +
-                    `Length: ${minW}-${maxW} words each.\n` +
-                    `One per line.`,
-            },
-        ],
-        max_output_tokens: 700,
+    const { data, error } = await supabase.rpc("spend_pro_credits", {
+        p_device_id: identityId,
+        p_cost: cost,
+        p_default_seed: fallback,
     });
 
-    const text = resp.output_text || resp.output?.[0]?.content?.find((c) => c.type === "output_text")?.text || "";
-    const { lines } = filterWithAutoRelax(text, { minWords: minW, maxWords: maxW, labelForLogs: label });
-    return lines.map(ensureSingleEndingEmoji);
+    if (error) throw error;
+
+    const row = Array.isArray(data) ? data[0] : data;
+    return {
+        ok: !!row?.ok,
+        proTokens: row?.tokens ?? fallback,
+        proUsed: row?.tokens_used ?? 0,
+        remainingPro: row?.remaining_pro ?? fallback,
+    };
 }
 
-// ======================
-// Daily bank builder
-// ======================
-const bankBuildLocks = new Set();
+async function sbGrantCredits(identityId, amount) {
+    const fallback = String(identityId).startsWith("user:")
+        ? CONFIG.DEFAULT_USER_PRO_BALANCE
+        : CONFIG.DEFAULT_GUEST_PRO_BALANCE;
 
-async function buildBankInBackground(label) {
-    if (!label || !isValidLabel(label)) return;
-    if (bankBuildLocks.has(label)) return;
+    const { data, error } = await supabase.rpc("grant_pro_credits", {
+        p_device_id: identityId,
+        p_amount: amount,
+        p_default_seed: fallback,
+    });
 
-    bankBuildLocks.add(label);
-    try {
-        const existing = await sbGetTodaysBank(label).catch(() => null);
-        if (existing?.length) return;
+    if (error) throw error;
 
-        console.log(`📚 Building daily bank for '${label}' (Supabase)...`);
-
-        let thoughts = [];
-        while (thoughts.length < CONFIG.BANK_DAILY_SIZE) {
-            const batch = await generateThoughtBatch(label, CONFIG.BANK_LEARN_BATCH_SIZE);
-            thoughts.push(...batch);
-            thoughts = [...new Set(thoughts)];
-            if (batch.length < 8) break;
-        }
-
-        thoughts = thoughts.slice(0, CONFIG.BANK_DAILY_SIZE);
-
-        if (thoughts.length < CONFIG.BANK_LEARN_MIN_ACCEPT) {
-            console.error(`❌ Bank generation too small for '${label}':`, thoughts.length);
-            return;
-        }
-
-        await sbUpsertBank(label, thoughts);
-        console.log(`✅ Bank saved for '${label}' (${thoughts.length})`);
-    } catch (e) {
-        console.error("Bank build error:", e);
-    } finally {
-        bankBuildLocks.delete(label);
-    }
+    const row = Array.isArray(data) ? data[0] : data;
+    return {
+        proTokens: row?.tokens ?? fallback,
+        proUsed: row?.tokens_used ?? 0,
+        remainingPro: row?.remaining_pro ?? fallback,
+    };
 }
 
-async function ensureDailyBank(label) {
-    const today = utcDayKey();
+// ─── RevenueCat dedupe ────────────────────────────────────────────────────────
 
-    const todays = await sbGetBankByDate(label, today).catch(() => null);
-    if (todays?.length) return { thoughts: todays, source: "today" };
+async function rcDedupe(eventId, appUserId, productId) {
+    if (!eventId) return true;
 
-    const latest = await sbGetLatestBank(label).catch(() => null);
-    if (latest?.length) {
-        buildBankInBackground(label);
-        return { thoughts: latest, source: "latest-fallback" };
-    }
+    const { error } = await supabase.from("revenuecat_events").insert({
+        event_id: eventId,
+        app_user_id: appUserId || null,
+        product_id: productId || null,
+    });
 
-    buildBankInBackground(label);
-    return { thoughts: [], source: "none" };
+    if (!error) return true;
+
+    const msg = String(error.message || "");
+    if (msg.toLowerCase().includes("duplicate") || msg.toLowerCase().includes("unique")) return false;
+
+    throw error;
 }
 
-async function prewarmHotLabels() {
-    if (!CONFIG.PREWARM_ENABLED) return;
+// ─── AI helpers ───────────────────────────────────────────────────────────────
 
-    const labels = (CONFIG.PREWARM_LABELS || []).map(normalizeLabel).map(cleanLabel).filter(isValidLabel);
-    if (!labels.length) return;
-
-    for (const label of labels) {
-        const existing = await sbGetTodaysBank(label).catch(() => null);
-        if (!existing?.length) buildBankInBackground(label);
-    }
-}
-
-// ======================
-// Enrichment
-// ======================
 async function enrichImage(imageDataUrl) {
     const r = await client.responses.create({
         model: CONFIG.CLASSIFY_MODEL,
@@ -565,17 +428,12 @@ async function enrichImage(imageDataUrl) {
 
 function classifyFromEnrich(enrich) {
     if (!enrich || typeof enrich.subject !== "string") return { ok: false, reason: "no_subject" };
-
     const label = normalizeLabel(enrich.subject);
     if (!label || label === "other") return { ok: false, reason: "other" };
-
     const category = label === "man" || label === "woman" ? "human" : "animal";
     return { ok: true, category, label };
 }
 
-// ======================
-// Subject-only classify
-// ======================
 async function classifySubjectOnly(imageDataUrl, timings) {
     const key = subjectCacheKey(imageDataUrl);
     const cached = subjectCacheGet(key);
@@ -631,9 +489,6 @@ async function classifySubjectOnly(imageDataUrl, timings) {
     return { subject: out.subject, label, cached: false };
 }
 
-// ======================
-// Pro thought generator
-// ======================
 async function generateProThought(label, enrich) {
     const minW = CONFIG.PRO_THOUGHT_MIN_WORDS;
     const maxW = CONFIG.PRO_THOUGHT_MAX_WORDS;
@@ -675,9 +530,6 @@ async function generateProThought(label, enrich) {
     return ensureSingleEndingEmoji(out);
 }
 
-// ======================
-// Ask generator
-// ======================
 function sanitizeAskHistory(history) {
     if (!Array.isArray(history)) return [];
     return history
@@ -734,12 +586,7 @@ Length: ${minW}-${maxW} words.
 Sometimes end with exactly ONE fitting emoji.`,
             },
             ...(vibe
-                ? [
-                    {
-                        role: "system",
-                        content: `Personality notes (how you talk): ${vibe}`,
-                    },
-                ]
+                ? [{ role: "system", content: `Personality notes (how you talk): ${vibe}` }]
                 : []),
             ...safeHistory,
             {
@@ -754,131 +601,22 @@ Sometimes end with exactly ONE fitting emoji.`,
     return ensureSingleEndingEmoji(out);
 }
 
-// ======================
-// Shared credits helpers
-// ======================
-async function sbGetStatus(identityId) {
-    await sbEnsureIdentityRow(identityId);
+// ─── Routes ───────────────────────────────────────────────────────────────────
 
-    const { data: existing, error: selErr } = await supabase
-        .from("device_usage")
-        .select("device_id, pro_tokens, pro_used")
-        .eq("device_id", identityId)
-        .maybeSingle();
+app.get("/health", (req, res) => res.json({ ok: true }));
 
-    if (selErr) throw selErr;
-
-    const fallback = String(identityId).startsWith("user:")
-        ? CONFIG.DEFAULT_USER_PRO_BALANCE
-        : CONFIG.DEFAULT_GUEST_PRO_BALANCE;
-
-    return {
-        proTokens: existing?.pro_tokens ?? fallback,
-        proUsed: existing?.pro_used ?? 0,
-        remainingPro: Math.max(0, (existing?.pro_tokens ?? fallback) - (existing?.pro_used ?? 0)),
-    };
-}
-
-async function sbSpendCredits(identityId, cost) {
-    const fallback = String(identityId).startsWith("user:")
-        ? CONFIG.DEFAULT_USER_PRO_BALANCE
-        : CONFIG.DEFAULT_GUEST_PRO_BALANCE;
-
-    const { data, error } = await supabase.rpc("spend_pro_credits", {
-        p_device_id: identityId,
-        p_cost: cost,
-        p_default_seed: fallback,
-    });
-
-    if (error) throw error;
-
-    const row = Array.isArray(data) ? data[0] : data;
-    return {
-        ok: !!row?.ok,
-        proTokens: row?.pro_tokens ?? fallback,
-        proUsed: row?.pro_used ?? 0,
-        remainingPro: row?.remaining_pro ?? fallback,
-    };
-}
-
-async function sbGrantCredits(identityId, amount) {
-    const fallback = String(identityId).startsWith("user:")
-        ? CONFIG.DEFAULT_USER_PRO_BALANCE
-        : CONFIG.DEFAULT_GUEST_PRO_BALANCE;
-
-    const { data, error } = await supabase.rpc("grant_pro_credits", {
-        p_device_id: identityId,
-        p_amount: amount,
-        p_default_seed: fallback,
-    });
-
-    if (error) throw error;
-
-    const row = Array.isArray(data) ? data[0] : data;
-    return {
-        proTokens: row?.pro_tokens ?? fallback,
-        proUsed: row?.pro_used ?? 0,
-        remainingPro: row?.remaining_pro ?? fallback,
-    };
-}
-
-// ======================
-// RevenueCat credits mapping + dedupe
-// ======================
-const PRODUCT_CREDITS = {
-    "10_smart_thoughts": 10,
-    "25_smart_thoughts": 25,
-    "50_smart_thoughts": 50,
-    "100_smart_thoughts": 100,
-};
-
-async function rcDedupe(eventId, appUserId, productId) {
-    if (!eventId) return true;
-
-    const { error } = await supabase
-        .from("revenuecat_events")
-        .insert({
-            event_id: eventId,
-            app_user_id: appUserId || null,
-            product_id: productId || null,
-        });
-
-    if (!error) return true;
-
-    const msg = String(error.message || "");
-    if (msg.toLowerCase().includes("duplicate") || msg.toLowerCase().includes("unique")) return false;
-
-    throw error;
-}
-
-// ======================
-// Reward for watching video ad
-// ======================
 app.post("/ads/reward-credit", async (req, res) => {
     try {
         const identityId = await resolveIdentityId(req);
-
-        if (!identityId) {
-            return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
-        }
-
-        if (!isValidIdentityId(identityId)) {
-            return res.status(400).json({ ok: false, error: "INVALID_IDENTITY_ID" });
-        }
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
+        if (!isValidIdentityId(identityId)) return res.status(400).json({ ok: false, error: "INVALID_IDENTITY_ID" });
 
         const amount = Math.max(1, Number(req.body?.amount) || 1);
         const source = String(req.body?.source || "paywall").trim();
 
         const granted = await sbGrantCredits(identityId, amount);
 
-        console.log("[ADS REWARD CREDIT]", {
-            identityId,
-            amount,
-            source,
-            remainingPro: granted.remainingPro,
-            proTokens: granted.proTokens,
-            proUsed: granted.proUsed,
-        });
+        console.log("[ADS REWARD CREDIT]", { identityId, amount, source, remainingPro: granted.remainingPro });
 
         return res.json({
             ok: true,
@@ -896,11 +634,6 @@ app.post("/ads/reward-credit", async (req, res) => {
     }
 });
 
-// ======================
-// Routes
-// ======================
-app.get("/health", (req, res) => res.json({ ok: true }));
-
 app.post("/status", async (req, res) => {
     try {
         const identityId = await resolveIdentityId(req);
@@ -911,15 +644,12 @@ app.post("/status", async (req, res) => {
 
         return res.json({
             ok: true,
-
             creditsRemaining: s.remainingPro,
             creditsTotal: s.proTokens,
             creditsUsed: s.proUsed,
-
             remainingPro: s.remainingPro,
             proTokens: s.proTokens,
             proUsed: s.proUsed,
-
             isPro,
             source: "supabase+revenuecat",
         });
@@ -929,10 +659,106 @@ app.post("/status", async (req, res) => {
     }
 });
 
+app.post("/thought", async (req, res) => {
+    const t0 = Date.now();
+    const rid = `srv_${crypto.randomBytes(6).toString("hex")}`;
+    const timings = {};
+
+    try {
+        const { imageDataUrl } = req.body || {};
+        const hintLabelRaw = req.body?.hintLabel;
+        const hintLabel = typeof hintLabelRaw === "string" ? normalizeLabel(hintLabelRaw) : null;
+
+        if (!imageDataUrl || typeof imageDataUrl !== "string") {
+            return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
+        }
+
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
+
+        const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
+
+        // Enrich image to get label + context
+        const enrich = await enrichImage(imageDataUrl);
+        timings.enrich_done = Date.now() - t0;
+
+        const out = classifyFromEnrich(enrich);
+        let label = out?.ok ? out.label : "other";
+
+        // Fall back to hint label or subject-only classify if enrich didn't give a clear label
+        if (!out?.ok) {
+            const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
+            if (hintLabel && isValidLabel(hintLabel) && !blocked.has(hintLabel) && hintLabel !== "other") {
+                label = hintLabel;
+                timings.used_hint_label = true;
+            } else {
+                const subj = await classifySubjectOnly(imageDataUrl, timings);
+                label = subj?.label || "other";
+                timings.subject_only_done = Date.now() - t0;
+            }
+        }
+
+        timings.label_set = Date.now() - t0;
+
+        const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
+        if (!isValidLabel(label) || blocked.has(label) || label === "other") {
+            return res.json({
+                ok: true,
+                thought: "I can't tell what I'm looking at… but I'm judging it anyway. 👀",
+                label: "unknown",
+                ms: Date.now() - t0,
+                timings,
+            });
+        }
+
+        // Spend a credit (skip if subscribed pro)
+        let spend = null;
+        if (!isPro) {
+            spend = await sbSpendCredits(identityId, 1);
+            timings.credits_spend_done = Date.now() - t0;
+
+            if (!spend.ok) {
+                return res.json({
+                    ok: false,
+                    error: "PRO_LIMIT_REACHED",
+                    remainingPro: spend.remainingPro ?? 0,
+                    ms: Date.now() - t0,
+                    timings,
+                });
+            }
+        } else {
+            timings.credits_spend_done = "skipped:subscribed_pro";
+        }
+
+        const thought = await generateProThought(label, enrich);
+        timings.generate_done = Date.now() - t0;
+
+        console.log("[THOUGHT] done", { rid, label, isPro, totalMs: Date.now() - t0 });
+
+        return res.json({
+            ok: true,
+            thought,
+            label,
+            enrich,
+            creditsRemaining: spend?.remainingPro ?? null,
+            creditsTotal: spend?.proTokens ?? null,
+            creditsUsed: spend?.proUsed ?? null,
+            remainingPro: spend?.remainingPro ?? null,
+            proTokens: spend?.proTokens ?? null,
+            proUsed: spend?.proUsed ?? null,
+            ms: Date.now() - t0,
+            timings,
+        });
+    } catch (e) {
+        console.error("Server error in /thought:", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR", ms: Date.now() - t0, timings });
+    }
+});
+
 app.post("/ask", async (req, res) => {
     const t0 = Date.now();
     const rid = `srv_${crypto.randomBytes(6).toString("hex")}`;
-    const timings = { start: 0 };
+    const timings = {};
 
     try {
         const identityId = await resolveIdentityId(req);
@@ -940,20 +766,10 @@ app.post("/ask", async (req, res) => {
 
         const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
 
-        console.log("[ASK PRO CHECK]", { identityId, isPro });
-
         let spend = null;
-
         if (!isPro) {
-            console.log("[ASK BEFORE SPEND]", { identityId, isPro });
-
             spend = await sbSpendCredits(identityId, 1);
-            timings.shared_credit_gate = spend;
-
-            console.log("[ASK SPEND RESULT]", { identityId, spend });
-
-            const check = await sbGetStatus(identityId);
-            console.log("[ASK STATUS AFTER SPEND]", { identityId, check });
+            timings.credit_gate = spend;
 
             if (!spend.ok) {
                 return res.status(402).json({
@@ -969,8 +785,7 @@ app.post("/ask", async (req, res) => {
                 });
             }
         } else {
-            timings.shared_credit_gate = "skipped:pro";
-            console.log("[ASK SKIPPED SPEND BECAUSE PRO]", { identityId });
+            timings.credit_gate = "skipped:pro";
         }
 
         const { imageDataUrl, question, pet, history } = req.body || {};
@@ -979,7 +794,6 @@ app.post("/ask", async (req, res) => {
 
         const q = String(question || "").trim();
         if (!q) return res.status(400).json({ ok: false, error: "MISSING_QUESTION" });
-
         if (!imageDataUrl || typeof imageDataUrl !== "string") {
             return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
         }
@@ -1002,7 +816,7 @@ app.post("/ask", async (req, res) => {
         if (!isValidLabel(label) || blocked.has(label) || label === "other") {
             return res.json({
                 ok: true,
-                answer: "I can’t tell what I’m looking at… so I’ll just assume you’re wrong. 👀",
+                answer: "I can't tell what I'm looking at… so I'll just assume you're wrong. 👀",
                 label: "unknown",
                 isPro,
                 creditsRemaining: !isPro ? spend?.remainingPro ?? null : null,
@@ -1013,24 +827,14 @@ app.post("/ask", async (req, res) => {
             });
         }
 
-        const tGen = Date.now();
         const answer = await generateAskAnswer({ label, pet, question: q, history: safeHistory });
-        timings.gen_done = Date.now() - t0;
+        timings.generate_done = Date.now() - t0;
 
-        console.log("[ASK] done", {
-            rid,
-            label,
-            isPro,
-            genMs: Date.now() - tGen,
-            totalMs: Date.now() - t0,
-            history: safeHistory.length,
-            remainingCredits: spend?.remainingPro,
-        });
+        console.log("[ASK] done", { rid, label, isPro, totalMs: Date.now() - t0 });
 
         return res.json({
             ok: true,
             answer,
-            tier: isPro ? "pro" : "free",
             isPro,
             creditsRemaining: !isPro ? spend?.remainingPro ?? null : null,
             creditsTotal: !isPro ? spend?.proTokens ?? null : null,
@@ -1044,212 +848,15 @@ app.post("/ask", async (req, res) => {
     }
 });
 
-app.post("/thought", async (req, res) => {
-    const t0 = Date.now();
-    const rid = `srv_${crypto.randomBytes(6).toString("hex")}`;
-    const timings = { start: 0 };
-
-    try {
-        const { tier, imageDataUrl } = req.body || {};
-        const isPro = tier === "pro";
-        const hintLabelRaw = req.body?.hintLabel;
-        const hintLabel = typeof hintLabelRaw === "string" ? normalizeLabel(hintLabelRaw) : null;
-
-        const contentLength = String(imageDataUrl || "").length;
-        console.log("[THOUGHT] start", { rid, tier, contentLength });
-
-        if (!imageDataUrl || typeof imageDataUrl !== "string") {
-            return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
-        }
-
-        let label = "other";
-        let enrich = null;
-
-        if (isPro) {
-            const tE = Date.now();
-            enrich = await enrichImage(imageDataUrl);
-            timings.enrich_done = Date.now() - t0;
-
-            const out = classifyFromEnrich(enrich);
-            label = out?.ok ? out.label : "other";
-
-            console.log("[THOUGHT] enrich", { rid, ms: Date.now() - tE, label });
-        } else {
-            const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
-
-            if (hintLabel && isValidLabel(hintLabel) && !blocked.has(hintLabel) && hintLabel !== "other") {
-                label = hintLabel;
-                timings.used_hint_label = true;
-                console.log("[THOUGHT] used_hint_label", { rid, label });
-            } else {
-                const tS = Date.now();
-                const subj = await classifySubjectOnly(imageDataUrl, timings);
-                timings.subject_only_done = Date.now() - t0;
-                label = subj?.label || "other";
-
-                console.log("[THOUGHT] subject_only", {
-                    rid,
-                    ms: Date.now() - tS,
-                    label,
-                    cached: !!subj?.cached,
-                    cacheHit: !!timings.subject_only_cache_hit,
-                });
-            }
-        }
-
-        timings.label_set = Date.now() - t0;
-
-        const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
-        if (!isValidLabel(label) || blocked.has(label) || label === "other") {
-            timings.done_free = Date.now() - t0;
-            console.log("[THOUGHT] unknown-label", { rid, label, totalMs: Date.now() - t0 });
-
-            return res.json({
-                ok: true,
-                thought: "I can’t tell what I’m looking at… but I’m judging it anyway. 👀",
-                tier: isPro ? "pro" : "free",
-                label: "unknown",
-                ms: Date.now() - t0,
-                timings,
-                enrich: isPro ? enrich : undefined,
-            });
-        }
-
-        if (!isPro) {
-            const tB = Date.now();
-            const bank = await ensureDailyBank(label);
-            const thoughts = bank.thoughts;
-            timings.bank_fetch_done = Date.now() - t0;
-
-            if (!thoughts?.length) {
-                timings.done_free = Date.now() - t0;
-
-                console.log("[THOUGHT] no_bank_anywhere", {
-                    rid,
-                    label,
-                    bankSource: bank.source,
-                    bankMs: Date.now() - tB,
-                    totalMs: Date.now() - t0,
-                });
-
-                return res.json({
-                    ok: true,
-                    thought: "I can’t tell what I’m looking at… but I’m judging it anyway. 👀",
-                    tier: "free",
-                    label: "unknown",
-                    ms: Date.now() - t0,
-                    timings,
-                    source: "fallback-no-bank",
-                });
-            }
-
-            timings.done_free = Date.now() - t0;
-
-            console.log("[THOUGHT] free_done", {
-                rid,
-                label,
-                bankSource: bank.source,
-                bankMs: Date.now() - tB,
-                totalMs: Date.now() - t0,
-                bankCount: thoughts.length,
-            });
-
-            return res.json({
-                ok: true,
-                thought: pick(thoughts),
-                tier: "free",
-                label,
-                ms: Date.now() - t0,
-                timings,
-                source: `supabase-bank:${bank.source}`,
-            });
-        }
-
-        const identityId = await resolveIdentityId(req);
-        if (!identityId) {
-            return res.status(400).json({ ok: false, error: "MISSING_DEVICE_ID" });
-        }
-
-        const isSubscribedPro =
-            SUBSCRIPTIONS_ENABLED && await validateProWithRevenueCat(identityId);
-
-        let spend = null;
-
-        if (!isSubscribedPro) {
-            const tSpend = Date.now();
-            spend = await sbSpendCredits(identityId, 1);
-            timings.credits_spend_done = Date.now() - t0;
-
-            console.log("[THOUGHT] spend", {
-                rid,
-                ok: spend.ok,
-                ms: Date.now() - tSpend,
-                remainingPro: spend.remainingPro,
-                isSubscribedPro,
-            });
-
-            if (!spend.ok) {
-                return res.json({
-                    ok: false,
-                    error: "PRO_LIMIT_REACHED",
-                    remainingPro: spend.remainingPro ?? 0,
-                    ms: Date.now() - t0,
-                    timings,
-                });
-            }
-        } else {
-            timings.credits_spend_done = "skipped:subscribed_pro";
-
-            console.log("[THOUGHT] spend skipped for subscribed pro", {
-                rid,
-                identityId,
-                isSubscribedPro,
-            });
-        }
-
-        const tGen = Date.now();
-        const thought = await generateProThought(label, enrich);
-        timings.pro_generate_done = Date.now() - t0;
-
-        console.log("[THOUGHT] pro_done", { rid, label, genMs: Date.now() - tGen, totalMs: Date.now() - t0 });
-
-        return res.json({
-            ok: true,
-            thought,
-            tier: "pro",
-            label,
-            enrich,
-
-            creditsRemaining: spend?.remainingPro ?? null,
-            creditsTotal: spend?.proTokens ?? null,
-            creditsUsed: spend?.proUsed ?? null,
-
-            remainingPro: spend?.remainingPro ?? null,
-            proTokens: spend?.proTokens ?? null,
-            proUsed: spend?.proUsed ?? null,
-
-            ms: Date.now() - t0,
-            timings,
-        });
-    } catch (e) {
-        console.error("Server error in /thought:", e);
-        return res.status(500).json({ ok: false, error: "SERVER_ERROR", ms: Date.now() - t0, timings });
-    }
-});
-
 app.post("/classify", async (req, res) => {
     const t0 = Date.now();
     const timings = {};
 
     try {
         const { imageDataUrl } = req.body || {};
-        const contentLength = String(imageDataUrl || "").length;
-
         if (!imageDataUrl || typeof imageDataUrl !== "string") {
             return res.status(400).json({ ok: false, error: "BAD_REQUEST" });
         }
-
-        console.log("[CLASSIFY] start", { contentLength });
 
         const subj = await classifySubjectOnly(imageDataUrl, timings);
         const label = subj?.label || "other";
@@ -1272,9 +879,6 @@ app.post("/classify", async (req, res) => {
     }
 });
 
-// ======================
-// RevenueCat Webhook
-// ======================
 app.post("/revenuecat/webhook", async (req, res) => {
     try {
         if (!CONFIG.RC_WEBHOOK_AUTH) {
@@ -1299,10 +903,12 @@ app.post("/revenuecat/webhook", async (req, res) => {
         const credits = productId ? PRODUCT_CREDITS[String(productId).trim()] : null;
 
         if (credits && appUserId) {
-            const isNew = await rcDedupe(String(eventId || crypto.randomUUID()), String(appUserId), String(productId));
-            if (!isNew) {
-                return res.json({ ok: true, deduped: true });
-            }
+            const isNew = await rcDedupe(
+                String(eventId || crypto.randomUUID()),
+                String(appUserId),
+                String(productId)
+            );
+            if (!isNew) return res.json({ ok: true, deduped: true });
 
             const granted = await sbGrantCredits(String(appUserId), credits);
             console.log("[RC WEBHOOK] credits granted", { type, appUserId, productId, credits });
@@ -1317,15 +923,10 @@ app.post("/revenuecat/webhook", async (req, res) => {
     }
 });
 
-// ======================
-// First-login seed for authenticated users
-// ======================
 app.post("/auth/login-bonus", async (req, res) => {
     try {
         const user = await getSupabaseUserFromBearer(req);
-        if (!user?.id) {
-            return res.status(401).json({ ok: false, error: "UNAUTHENTICATED" });
-        }
+        if (!user?.id) return res.status(401).json({ ok: false, error: "UNAUTHENTICATED" });
 
         const identityId = requireIdentityId(req) || makeUserIdentityId(user.id);
         if (!identityId || !String(identityId).startsWith("user:")) {
@@ -1333,8 +934,7 @@ app.post("/auth/login-bonus", async (req, res) => {
         }
 
         const created = await sbEnsureUsageRow(identityId, {
-            proTokens: CONFIG.DEFAULT_USER_PRO_BALANCE,
-            freeChatTokens: CONFIG.DEFAULT_USER_FREE_CHAT_TOKENS,
+            tokens: CONFIG.DEFAULT_USER_PRO_BALANCE,
         });
 
         const s = await sbGetStatus(identityId);
@@ -1344,69 +944,16 @@ app.post("/auth/login-bonus", async (req, res) => {
             ok: true,
             created,
             identityId,
-
             creditsRemaining: s.remainingPro,
             creditsTotal: s.proTokens,
             creditsUsed: s.proUsed,
-
             remainingPro: s.remainingPro,
             proTokens: s.proTokens,
             proUsed: s.proUsed,
-
             isPro,
         });
     } catch (e) {
         console.error("auth seed error", e);
-        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
-    }
-});
-
-// ======================
-// DEV-only endpoints
-// ======================
-const DEV_ADMIN_KEY = process.env.DEV_ADMIN_KEY;
-
-app.post("/dev/set-free-chat", async (req, res) => {
-    try {
-        const key = req.headers["x-dev-admin-key"];
-        if (!DEV_ADMIN_KEY || key !== DEV_ADMIN_KEY) {
-            return res.status(403).json({ ok: false, error: "FORBIDDEN" });
-        }
-
-        const id = await resolveIdentityId(req);
-        if (!id) return res.status(400).json({ ok: false, error: "Missing deviceId" });
-
-        const rem = Number(req.body?.remaining);
-        const free_chat_tokens = String(id).startsWith("user:")
-            ? CONFIG.DEFAULT_USER_FREE_CHAT_TOKENS
-            : CONFIG.DEFAULT_GUEST_FREE_CHAT_TOKENS;
-
-        if (!(rem === 0 || rem === free_chat_tokens)) {
-            return res.status(400).json({ ok: false, error: `Remaining must be 0 or ${free_chat_tokens}` });
-        }
-
-        await sbEnsureIdentityRow(id);
-
-        const free_chat_used = rem === free_chat_tokens ? 0 : free_chat_tokens;
-
-        const { error } = await supabase
-            .from("device_usage")
-            .update({
-                free_chat_tokens,
-                free_chat_used,
-            })
-            .eq("device_id", id);
-
-        if (error) throw error;
-
-        return res.json({
-            ok: true,
-            remainingFreeChat: rem,
-            freeChatTokens: free_chat_tokens,
-            freeChatUsed: free_chat_used,
-        });
-    } catch (e) {
-        console.error("dev set free chat error", e);
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
@@ -1433,15 +980,6 @@ app.post("/credits/grant", async (req, res) => {
     }
 });
 
-const PORT = process.env.PORT || 8787;
-
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
-
-    if (CONFIG.PREWARM_ON_START) prewarmHotLabels();
-
-    const mins = Number(CONFIG.PREWARM_CHECK_INTERVAL_MINUTES || 0);
-    if (mins > 0) {
-        setInterval(() => prewarmHotLabels(), mins * 60 * 1000);
-    }
 });
