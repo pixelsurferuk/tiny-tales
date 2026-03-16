@@ -22,7 +22,7 @@ const CONFIG = {
     CLASSIFY_MODEL: "gpt-4o-mini",
     THOUGHT_MODEL: "gpt-4o-mini",
 
-    DEFAULT_GUEST_PRO_BALANCE: Number(process.env.DEFAULT_GUEST_PRO_BALANCE || 5),
+    DEFAULT_GUEST_PRO_BALANCE: Number(process.env.DEFAULT_GUEST_PRO_BALANCE || 0),
     DEFAULT_USER_PRO_BALANCE: Number(process.env.DEFAULT_USER_PRO_BALANCE || 5),
 
     SUBJECT_CACHE_TTL_MS: 10 * 60 * 1000,
