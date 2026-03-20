@@ -19,8 +19,10 @@ const CONFIG = {
     ASK_MIN_WORDS: 10,
     ASK_MAX_WORDS: 35,
 
-    CLASSIFY_MODEL: "gpt-4o-mini",
-    THOUGHT_MODEL: "gpt-4o-mini",
+    /*CLASSIFY_MODEL: "gpt-4o-mini",
+    THOUGHT_MODEL: "gpt-4o-mini",*/
+    CLASSIFY_MODEL: "meta-llama/llama-4-scout-17b-16e-instruct",
+    THOUGHT_MODEL:  "meta-llama/llama-4-scout-17b-16e-instruct",
 
     DEFAULT_GUEST_PRO_BALANCE: Number(process.env.DEFAULT_GUEST_PRO_BALANCE || 5),
     DEFAULT_USER_PRO_BALANCE: Number(process.env.DEFAULT_USER_PRO_BALANCE || 0),
@@ -39,7 +41,11 @@ const CONFIG = {
 };
 
 const SUBSCRIPTIONS_ENABLED = true;
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+//const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const client = new OpenAI({
+    apiKey: process.env.GROQ_API_KEY,
+    baseURL: "https://api.groq.com/openai/v1",
+});
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const REVENUECAT_SECRET_KEY = process.env.REVENUECAT_SECRET_KEY;
