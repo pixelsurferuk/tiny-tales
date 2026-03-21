@@ -19,8 +19,6 @@ const CONFIG = {
     ASK_MIN_WORDS: 10,
     ASK_MAX_WORDS: 35,
 
-    /*CLASSIFY_MODEL: "gpt-4o-mini",
-    THOUGHT_MODEL: "gpt-4o-mini",*/
     CLASSIFY_MODEL: "meta-llama/llama-4-scout-17b-16e-instruct",
     THOUGHT_MODEL:  "meta-llama/llama-4-scout-17b-16e-instruct",
 
@@ -41,7 +39,6 @@ const CONFIG = {
 };
 
 const SUBSCRIPTIONS_ENABLED = true;
-//const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new OpenAI({
     apiKey: process.env.GROQ_API_KEY,
     baseURL: "https://api.groq.com/openai/v1",
@@ -55,8 +52,6 @@ const PORT = process.env.PORT || 8787;
 const rcCache = new Map();
 const subjectCache = new Map();
 
-const utcDayKey = () => new Date().toISOString().slice(0, 10);
-const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const cleanLabel = (l) => String(l || "").trim().toLowerCase();
 const isValidLabel = (l) => /^[a-z]{2,24}$/.test(l);
 
@@ -184,12 +179,6 @@ function stripLinePrefix(t) {
     return String(t || "").replace(/^[-•\d.)\s]+/, "").trim();
 }
 
-function wordCount(str) {
-    const s = String(str || "").trim();
-    if (!s) return 0;
-    return s.split(/\s+/).filter(Boolean).length;
-}
-
 function ensureSingleEndingEmoji(text) {
     const t = String(text || "").trim();
     if (!t) return t;
@@ -286,6 +275,17 @@ async function sbEnsureIdentityRow(identityId) {
     });
 }
 
+// ─── Linked account helper ────────────────────────────────────────────────────
+
+async function getLinkedId(identityId) {
+    const { data } = await supabase
+        .from("device_usage")
+        .select("linked_user_id, linked_guest_id")
+        .eq("device_id", identityId)
+        .maybeSingle();
+    return data?.linked_user_id || data?.linked_guest_id || null;
+}
+
 // ─── Credits helpers ──────────────────────────────────────────────────────────
 
 async function sbGetStatus(identityId) {
@@ -324,12 +324,29 @@ async function sbSpendCredits(identityId, cost) {
     if (error) throw error;
 
     const row = Array.isArray(data) ? data[0] : data;
-    return {
+    const result = {
         ok: !!row?.ok,
         proTokens: row?.tokens ?? fallback,
         proUsed: row?.tokens_used ?? 0,
         remainingPro: row?.remaining_pro ?? fallback,
     };
+
+    // Mirror spend to linked account so both stay in sync
+    if (result.ok) {
+        const linkedId = await getLinkedId(identityId);
+        if (linkedId) {
+            const linkedFallback = String(linkedId).startsWith("user:")
+                ? CONFIG.DEFAULT_USER_PRO_BALANCE
+                : CONFIG.DEFAULT_GUEST_PRO_BALANCE;
+            await supabase.rpc("spend_pro_credits", {
+                p_device_id: linkedId,
+                p_cost: cost,
+                p_default_seed: linkedFallback,
+            }).catch(e => console.warn("[spend mirror failed]", e?.message));
+        }
+    }
+
+    return result;
 }
 
 async function sbGrantCredits(identityId, amount) {
@@ -346,11 +363,26 @@ async function sbGrantCredits(identityId, amount) {
     if (error) throw error;
 
     const row = Array.isArray(data) ? data[0] : data;
-    return {
+    const result = {
         proTokens: row?.tokens ?? fallback,
         proUsed: row?.tokens_used ?? 0,
         remainingPro: row?.remaining_pro ?? fallback,
     };
+
+    // Mirror grant to linked account so both stay in sync
+    const linkedId = await getLinkedId(identityId);
+    if (linkedId) {
+        const linkedFallback = String(linkedId).startsWith("user:")
+            ? CONFIG.DEFAULT_USER_PRO_BALANCE
+            : CONFIG.DEFAULT_GUEST_PRO_BALANCE;
+        await supabase.rpc("grant_pro_credits", {
+            p_device_id: linkedId,
+            p_amount: amount,
+            p_default_seed: linkedFallback,
+        }).catch(e => console.warn("[grant mirror failed]", e?.message));
+    }
+
+    return result;
 }
 
 // ─── RevenueCat dedupe ────────────────────────────────────────────────────────
@@ -687,14 +719,12 @@ app.post("/thought", async (req, res) => {
 
         const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
 
-        // Enrich image to get label + context
         const enrich = await enrichImage(imageDataUrl);
         timings.enrich_done = Date.now() - t0;
 
         const out = classifyFromEnrich(enrich);
         let label = out?.ok ? out.label : "other";
 
-        // Fall back to hint label or subject-only classify if enrich didn't give a clear label
         if (!out?.ok) {
             const blocked = new Set(["animal", "pet", "mammal", "person", "human"]);
             if (hintLabel && isValidLabel(hintLabel) && !blocked.has(hintLabel) && hintLabel !== "other") {
@@ -720,7 +750,6 @@ app.post("/thought", async (req, res) => {
             });
         }
 
-        // Spend a credit (skip if subscribed pro)
         let spend = null;
         if (!isPro) {
             spend = await sbSpendCredits(identityId, 1);
@@ -990,15 +1019,18 @@ app.post("/credits/grant", async (req, res) => {
 });
 
 app.post("/auth/transfer-credits", async (req, res) => {
-    const { guestId, userId } = req.body;
-    if (!guestId || !userId) return res.json({ ok: false, error: "Missing guestId or userId" });
-
     try {
+        console.log("[transfer-credits] called", { guestId: req.body?.guestId, userId: req.body?.userId });
+        const { guestId, userId } = req.body;
+        if (!guestId || !userId) return res.json({ ok: false, error: "Missing guestId or userId" });
+
         const { data, error } = await supabase.rpc("transfer_guest_credits", {
             p_guest_id: guestId,
             p_user_id: userId,
         });
         if (error) throw error;
+
+        console.log("[transfer-credits] transferred", data, "credits");
         res.json({ ok: true, transferred: data });
     } catch (e) {
         console.warn("[transfer-credits]", e?.message);
