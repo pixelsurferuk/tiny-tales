@@ -989,6 +989,23 @@ app.post("/credits/grant", async (req, res) => {
     }
 });
 
+app.post("/auth/transfer-credits", async (req, res) => {
+    const { guestId, userId } = req.body;
+    if (!guestId || !userId) return res.json({ ok: false, error: "Missing guestId or userId" });
+
+    try {
+        const { data, error } = await supabase.rpc("transfer_guest_credits", {
+            p_guest_id: guestId,
+            p_user_id: userId,
+        });
+        if (error) throw error;
+        res.json({ ok: true, transferred: data });
+    } catch (e) {
+        console.warn("[transfer-credits]", e?.message);
+        res.json({ ok: false, error: e?.message });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
