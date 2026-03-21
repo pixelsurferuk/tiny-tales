@@ -98,10 +98,8 @@ function isValidIdentityId(value) {
 async function resolveIdentityId(req) {
     const explicit = requireIdentityId(req);
     if (explicit) return explicit;
-
     const user = await getSupabaseUserFromBearer(req);
     if (user?.id) return makeUserIdentityId(user.id);
-
     return null;
 }
 
@@ -116,10 +114,8 @@ function makeUserIdentityId(userId) {
 async function getSupabaseUserFromBearer(req) {
     const auth = String(req.headers?.authorization || "").trim();
     if (!auth.toLowerCase().startsWith("bearer ")) return null;
-
     const token = auth.slice(7).trim();
     if (!token) return null;
-
     const { data, error } = await supabase.auth.getUser(token);
     if (error || !data?.user) return null;
     return data.user;
@@ -196,10 +192,7 @@ function subjectCacheKey(imageDataUrl) {
 function subjectCacheGet(key) {
     const v = subjectCache.get(key);
     if (!v) return null;
-    if (Date.now() > v.expiresAt) {
-        subjectCache.delete(key);
-        return null;
-    }
+    if (Date.now() > v.expiresAt) { subjectCache.delete(key); return null; }
     return v;
 }
 
@@ -222,19 +215,13 @@ function extractHardwareFingerprint(identityId) {
 
 async function sbHasSeenHardwareId(hardwareId) {
     if (!hardwareId) return false;
-
     const { data, error } = await supabase
         .from("device_usage")
         .select("device_id")
         .eq("hardware_id", hardwareId)
         .limit(1)
         .maybeSingle();
-
-    if (error) {
-        console.warn("[hardware_id] lookup failed:", error.message);
-        return false;
-    }
-
+    if (error) { console.warn("[hardware_id] lookup failed:", error.message); return false; }
     return !!data;
 }
 
@@ -275,17 +262,6 @@ async function sbEnsureIdentityRow(identityId) {
     });
 }
 
-// ─── Linked account helper ────────────────────────────────────────────────────
-
-async function getLinkedId(identityId) {
-    const { data } = await supabase
-        .from("device_usage")
-        .select("linked_user_id, linked_guest_id")
-        .eq("device_id", identityId)
-        .maybeSingle();
-    return data?.linked_user_id || data?.linked_guest_id || null;
-}
-
 // ─── Credits helpers ──────────────────────────────────────────────────────────
 
 async function sbGetStatus(identityId) {
@@ -324,29 +300,12 @@ async function sbSpendCredits(identityId, cost) {
     if (error) throw error;
 
     const row = Array.isArray(data) ? data[0] : data;
-    const result = {
+    return {
         ok: !!row?.ok,
         proTokens: row?.tokens ?? fallback,
         proUsed: row?.tokens_used ?? 0,
         remainingPro: row?.remaining_pro ?? fallback,
     };
-
-    // Mirror spend to linked account so both stay in sync
-    if (result.ok) {
-        const linkedId = await getLinkedId(identityId);
-        if (linkedId) {
-            const linkedFallback = String(linkedId).startsWith("user:")
-                ? CONFIG.DEFAULT_USER_PRO_BALANCE
-                : CONFIG.DEFAULT_GUEST_PRO_BALANCE;
-            await supabase.rpc("spend_pro_credits", {
-                p_device_id: linkedId,
-                p_cost: cost,
-                p_default_seed: linkedFallback,
-            }).catch(e => console.warn("[spend mirror failed]", e?.message));
-        }
-    }
-
-    return result;
 }
 
 async function sbGrantCredits(identityId, amount) {
@@ -363,26 +322,11 @@ async function sbGrantCredits(identityId, amount) {
     if (error) throw error;
 
     const row = Array.isArray(data) ? data[0] : data;
-    const result = {
+    return {
         proTokens: row?.tokens ?? fallback,
         proUsed: row?.tokens_used ?? 0,
         remainingPro: row?.remaining_pro ?? fallback,
     };
-
-    // Mirror grant to linked account so both stay in sync
-    const linkedId = await getLinkedId(identityId);
-    if (linkedId) {
-        const linkedFallback = String(linkedId).startsWith("user:")
-            ? CONFIG.DEFAULT_USER_PRO_BALANCE
-            : CONFIG.DEFAULT_GUEST_PRO_BALANCE;
-        await supabase.rpc("grant_pro_credits", {
-            p_device_id: linkedId,
-            p_amount: amount,
-            p_default_seed: linkedFallback,
-        }).catch(e => console.warn("[grant mirror failed]", e?.message));
-    }
-
-    return result;
 }
 
 // ─── RevenueCat dedupe ────────────────────────────────────────────────────────
