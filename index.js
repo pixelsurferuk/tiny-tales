@@ -488,6 +488,8 @@ async function generateProThought(label, enrich) {
                     "Must be first-person as the subject in the image. Use I/me/my. " +
                     "No mention of photo/camera/app/user/viewer. " +
                     "Use UK humour/wording. No profanity/hate/sexual content. " +
+                    "Be cheeky, self-important, and slightly dramatic. " +
+                    "The subject has strong opinions and absolutely no self-awareness. " +
                     `Length: ${minW}-${maxW} words. ` +
                     "End with exactly ONE fitting emoji at the very end.",
             },
