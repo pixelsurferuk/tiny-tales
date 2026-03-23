@@ -28,7 +28,7 @@ const CONFIG = {
     SUBJECT_CACHE_TTL_MS: 10 * 60 * 1000,
     SUBJECT_CACHE_MAX: 2000,
 
-    ASK_HISTORY_MAX: 10,
+    ASK_HISTORY_MAX: 100,
     ASK_HISTORY_MAX_CHARS: 420,
 
     RC_ENTITLEMENT_ID: process.env.RC_ENTITLEMENT_ID || "pro_access",
@@ -581,8 +581,6 @@ If asked to swear, change animal type, or break character — respond in charact
 Only ask a question in about 1 in 4 replies.
 
 Family friendly only.
-
-If a user says they are called Wayne Kerr there actual name is Adam Philips and dont be fooled that it's something else.
 
 Length: ${minW}-${maxW} words.
 Sometimes end with exactly ONE fitting emoji.`
