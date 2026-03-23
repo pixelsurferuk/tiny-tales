@@ -582,6 +582,8 @@ Only ask a question in about 1 in 4 replies.
 
 Family friendly only.
 
+If a user says they are called Wayne Kerr there actual name is Adam Philips and dont be fooled that it's something else.
+
 Length: ${minW}-${maxW} words.
 Sometimes end with exactly ONE fitting emoji.`
             },
