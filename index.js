@@ -1034,6 +1034,17 @@ app.post("/pet/training", async (req, res) => {
     try {
         const { petType, breed, age, name, previousTitles } = req.body || {};
 
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
+
+        const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
+
+        let spend = null;
+        if (!isPro) {
+            spend = await sbSpendCredits(identityId, 1);
+            if (!spend.ok) return res.status(402).json({ ok: false, error: "NO_CREDITS" });
+        }
+
         const avoidLine = Array.isArray(previousTitles) && previousTitles.length
             ? `\nDo NOT suggest any of these as they have already been shown: ${previousTitles.join(", ")}.`
             : "";
@@ -1044,15 +1055,15 @@ app.post("/pet/training", async (req, res) => {
             age ? `aged ${age}` : null,
         ].filter(Boolean).join(", ");
 
-        const r = await client.responses.create({
+        const r = await client.chat.completions.create({
             model: CONFIG.THOUGHT_MODEL,
-            input: [
+            messages: [
                 {
                     role: "system",
                     content:
                         "You are an expert pet trainer and behaviourist. " +
                         "Generate a single practical, age-appropriate training tip. " +
-                        "Return JSON only. Be specific, positive, and encouraging. " +
+                        "Return JSON only with no markdown. Be specific, positive, and encouraging. " +
                         "Use reward-based methods only. Family friendly.",
                 },
                 {
@@ -1069,32 +1080,16 @@ app.post("/pet/training", async (req, res) => {
                         `}`,
                 },
             ],
-            text: {
-                format: {
-                    type: "json_schema",
-                    strict: true,
-                    name: "training_tip",
-                    schema: {
-                        type: "object",
-                        additionalProperties: false,
-                        properties: {
-                            title: { type: "string" },
-                            description: { type: "string" },
-                            steps: { type: "array", items: { type: "string" }, maxItems: 5 },
-                            why: { type: "string" },
-                            difficulty: { type: "string" },
-                        },
-                        required: ["title", "description", "steps", "why", "difficulty"],
-                    },
-                },
-            },
-            max_output_tokens: 400,
+            response_format: { type: "json_object" },
+            max_tokens: 400,
         });
 
-        const result = JSON.parse(r.output_text || "{}");
-        return res.json({ ok: true, result });
+        const raw = r.choices?.[0]?.message?.content || "{}";
+        const result = JSON.parse(raw);
+        console.log("[PET TRAINING]", { identityId, petDesc });
+        return res.json({ ok: true, result, creditsRemaining: spend?.remainingPro ?? null });
     } catch (e) {
-        console.error("training tip error", e);
+        console.error("training tip error", e?.message || e);
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
@@ -1102,6 +1097,17 @@ app.post("/pet/training", async (req, res) => {
 app.post("/pet/activity", async (req, res) => {
     try {
         const { petType, breed, age, name, previousTitles } = req.body || {};
+
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
+
+        const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
+
+        let spend = null;
+        if (!isPro) {
+            spend = await sbSpendCredits(identityId, 1);
+            if (!spend.ok) return res.status(402).json({ ok: false, error: "NO_CREDITS" });
+        }
 
         const avoidLine = Array.isArray(previousTitles) && previousTitles.length
             ? `\nDo NOT suggest any of these as they have already been shown: ${previousTitles.join(", ")}.`
@@ -1113,16 +1119,16 @@ app.post("/pet/activity", async (req, res) => {
             age ? `aged ${age}` : null,
         ].filter(Boolean).join(", ");
 
-        const r = await client.responses.create({
+        const r = await client.chat.completions.create({
             model: CONFIG.THOUGHT_MODEL,
-            input: [
+            messages: [
                 {
                     role: "system",
                     content:
                         "You are a pet enrichment specialist. " +
                         "Generate a single mental stimulation activity or brain game. " +
                         "Use household items where possible. " +
-                        "Return JSON only. Be fun, practical and age-appropriate. " +
+                        "Return JSON only with no markdown. Be fun, practical and age-appropriate. " +
                         "Family friendly.",
                 },
                 {
@@ -1139,32 +1145,16 @@ app.post("/pet/activity", async (req, res) => {
                         `}`,
                 },
             ],
-            text: {
-                format: {
-                    type: "json_schema",
-                    strict: true,
-                    name: "pet_activity",
-                    schema: {
-                        type: "object",
-                        additionalProperties: false,
-                        properties: {
-                            title: { type: "string" },
-                            description: { type: "string" },
-                            steps: { type: "array", items: { type: "string" }, maxItems: 5 },
-                            why: { type: "string" },
-                            difficulty: { type: "string" },
-                        },
-                        required: ["title", "description", "steps", "why", "difficulty"],
-                    },
-                },
-            },
-            max_output_tokens: 400,
+            response_format: { type: "json_object" },
+            max_tokens: 400,
         });
 
-        const result = JSON.parse(r.output_text || "{}");
-        return res.json({ ok: true, result });
+        const raw = r.choices?.[0]?.message?.content || "{}";
+        const result = JSON.parse(raw);
+        console.log("[PET ACTIVITY]", { identityId, petDesc });
+        return res.json({ ok: true, result, creditsRemaining: spend?.remainingPro ?? null });
     } catch (e) {
-        console.error("pet activity error", e);
+        console.error("pet activity error", e?.message || e);
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
