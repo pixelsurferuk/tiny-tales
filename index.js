@@ -1030,6 +1030,23 @@ app.post("/auth/transfer-credits", async (req, res) => {
     }
 });
 
+async function withRetry(fn, retries = 2, delayMs = 800) {
+    for (let i = 0; i <= retries; i++) {
+        try {
+            return await fn();
+        } catch (e) {
+            const isCapacity = String(e?.message || "").toLowerCase().includes("over capacity") ||
+                String(e?.message || "").toLowerCase().includes("503") ||
+                e?.status === 503;
+            if (isCapacity && i < retries) {
+                await new Promise(r => setTimeout(r, delayMs * Math.pow(2, i)));
+                continue;
+            }
+            throw e;
+        }
+    }
+}
+
 app.post("/pet/training", async (req, res) => {
     try {
         const { petType, breed, age, name, previousTitles } = req.body || {};
@@ -1039,10 +1056,10 @@ app.post("/pet/training", async (req, res) => {
 
         const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
 
-        let spend = null;
+        // Check credits before attempting — but don't spend yet
         if (!isPro) {
-            spend = await sbSpendCredits(identityId, 1);
-            if (!spend.ok) return res.status(402).json({ ok: false, error: "NO_CREDITS" });
+            const status = await sbGetStatus(identityId);
+            if (status.remainingPro <= 0) return res.status(402).json({ ok: false, error: "NO_CREDITS" });
         }
 
         const avoidLine = Array.isArray(previousTitles) && previousTitles.length
@@ -1055,7 +1072,7 @@ app.post("/pet/training", async (req, res) => {
             age ? `aged ${age}` : null,
         ].filter(Boolean).join(", ");
 
-        const r = await client.chat.completions.create({
+        const r = await withRetry(() => client.chat.completions.create({
             model: CONFIG.THOUGHT_MODEL,
             messages: [
                 {
@@ -1082,10 +1099,17 @@ app.post("/pet/training", async (req, res) => {
             ],
             response_format: { type: "json_object" },
             max_tokens: 400,
-        });
+        }));
 
         const raw = r.choices?.[0]?.message?.content || "{}";
         const result = JSON.parse(raw);
+
+        // Only spend credit after successful generation
+        let spend = null;
+        if (!isPro) {
+            spend = await sbSpendCredits(identityId, 1);
+        }
+
         console.log("[PET TRAINING]", { identityId, petDesc });
         return res.json({ ok: true, result, creditsRemaining: spend?.remainingPro ?? null });
     } catch (e) {
@@ -1103,10 +1127,10 @@ app.post("/pet/activity", async (req, res) => {
 
         const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
 
-        let spend = null;
+        // Check credits before attempting — but don't spend yet
         if (!isPro) {
-            spend = await sbSpendCredits(identityId, 1);
-            if (!spend.ok) return res.status(402).json({ ok: false, error: "NO_CREDITS" });
+            const status = await sbGetStatus(identityId);
+            if (status.remainingPro <= 0) return res.status(402).json({ ok: false, error: "NO_CREDITS" });
         }
 
         const avoidLine = Array.isArray(previousTitles) && previousTitles.length
@@ -1119,7 +1143,7 @@ app.post("/pet/activity", async (req, res) => {
             age ? `aged ${age}` : null,
         ].filter(Boolean).join(", ");
 
-        const r = await client.chat.completions.create({
+        const r = await withRetry(() => client.chat.completions.create({
             model: CONFIG.THOUGHT_MODEL,
             messages: [
                 {
@@ -1147,10 +1171,17 @@ app.post("/pet/activity", async (req, res) => {
             ],
             response_format: { type: "json_object" },
             max_tokens: 400,
-        });
+        }));
 
         const raw = r.choices?.[0]?.message?.content || "{}";
         const result = JSON.parse(raw);
+
+        // Only spend credit after successful generation
+        let spend = null;
+        if (!isPro) {
+            spend = await sbSpendCredits(identityId, 1);
+        }
+
         console.log("[PET ACTIVITY]", { identityId, petDesc });
         return res.json({ ok: true, result, creditsRemaining: spend?.remainingPro ?? null });
     } catch (e) {
