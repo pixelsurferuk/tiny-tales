@@ -1054,6 +1054,139 @@ app.post("/ads/status", async (req, res) => {
     }
 });
 
+// ─── Add these two endpoints to index.js (before app.listen) ─────────────────
+
+app.post("/pet/training", async (req, res) => {
+    try {
+        const { petType, breed, age, name } = req.body || {};
+
+        const petDesc = [
+            name ? `named ${name}` : null,
+            breed || petType || "pet",
+            age ? `aged ${age}` : null,
+        ].filter(Boolean).join(", ");
+
+        const r = await client.responses.create({
+            model: CONFIG.THOUGHT_MODEL,
+            input: [
+                {
+                    role: "system",
+                    content:
+                        "You are an expert pet trainer and behaviourist. " +
+                        "Generate a single practical, age-appropriate training tip. " +
+                        "Return JSON only. Be specific, positive, and encouraging. " +
+                        "Use reward-based methods only. Family friendly.",
+                },
+                {
+                    role: "user",
+                    content:
+                        `Generate a training tip for a ${petDesc}.\n` +
+                        `Return JSON with:\n` +
+                        `{\n` +
+                        `  "title": "Short tip name",\n` +
+                        `  "description": "Brief intro sentence",\n` +
+                        `  "steps": ["Step 1", "Step 2", "Step 3"],\n` +
+                        `  "why": "Why this is good for this pet at this age",\n` +
+                        `  "difficulty": "Easy|Medium|Challenging"\n` +
+                        `}`,
+                },
+            ],
+            text: {
+                format: {
+                    type: "json_schema",
+                    strict: true,
+                    name: "training_tip",
+                    schema: {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                            title: { type: "string" },
+                            description: { type: "string" },
+                            steps: { type: "array", items: { type: "string" }, maxItems: 5 },
+                            why: { type: "string" },
+                            difficulty: { type: "string" },
+                        },
+                        required: ["title", "description", "steps", "why", "difficulty"],
+                    },
+                },
+            },
+            max_output_tokens: 400,
+        });
+
+        const result = JSON.parse(r.output_text || "{}");
+        return res.json({ ok: true, result });
+    } catch (e) {
+        console.error("training tip error", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    }
+});
+
+app.post("/pet/activity", async (req, res) => {
+    try {
+        const { petType, breed, age, name } = req.body || {};
+
+        const petDesc = [
+            name ? `named ${name}` : null,
+            breed || petType || "pet",
+            age ? `aged ${age}` : null,
+        ].filter(Boolean).join(", ");
+
+        const r = await client.responses.create({
+            model: CONFIG.THOUGHT_MODEL,
+            input: [
+                {
+                    role: "system",
+                    content:
+                        "You are a pet enrichment specialist. " +
+                        "Generate a single mental stimulation activity or brain game. " +
+                        "Use household items where possible. " +
+                        "Return JSON only. Be fun, practical and age-appropriate. " +
+                        "Family friendly.",
+                },
+                {
+                    role: "user",
+                    content:
+                        `Generate a mental stimulation brain game for a ${petDesc}.\n` +
+                        `Return JSON with:\n` +
+                        `{\n` +
+                        `  "title": "Game name",\n` +
+                        `  "description": "What this game involves",\n` +
+                        `  "steps": ["Step 1", "Step 2", "Step 3"],\n` +
+                        `  "why": "Why this mental stimulation is good for this pet",\n` +
+                        `  "difficulty": "Easy|Medium|Challenging"\n` +
+                        `}`,
+                },
+            ],
+            text: {
+                format: {
+                    type: "json_schema",
+                    strict: true,
+                    name: "pet_activity",
+                    schema: {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                            title: { type: "string" },
+                            description: { type: "string" },
+                            steps: { type: "array", items: { type: "string" }, maxItems: 5 },
+                            why: { type: "string" },
+                            difficulty: { type: "string" },
+                        },
+                        required: ["title", "description", "steps", "why", "difficulty"],
+                    },
+                },
+            },
+            max_output_tokens: 400,
+        });
+
+        const result = JSON.parse(r.output_text || "{}");
+        return res.json({ ok: true, result });
+    } catch (e) {
+        console.error("pet activity error", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
