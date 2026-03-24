@@ -1074,6 +1074,252 @@ async function withRetry(fn, retries = 2, delayMs = 800) {
     }
 }
 
+async function withRetry(fn, retries = 2, delayMs = 800) {
+    for (let i = 0; i <= retries; i++) {
+        try {
+            return await fn();
+        } catch (e) {
+            const isCapacity = String(e?.message || "").toLowerCase().includes("over capacity") ||
+                String(e?.message || "").toLowerCase().includes("503") ||
+                e?.status === 503;
+            if (isCapacity && i < retries) {
+                await new Promise(r => setTimeout(r, delayMs * Math.pow(2, i)));
+                continue;
+            }
+            throw e;
+        }
+    }
+}
+
+// ─── Pet Tips Pool ────────────────────────────────────────────────────────────
+
+async function generateTipsSmart({
+                                     tipType,
+                                     petType,
+                                     ageRange,
+                                     existingTitles = [],
+                                     targetCount = 20,
+                                 }) {
+    const MAX_ATTEMPTS = 6;
+    const results = [];
+    const seenTitles = new Set(existingTitles.map(t => t.toLowerCase()));
+
+    let attempts = 0;
+
+    while (results.length < targetCount && attempts < MAX_ATTEMPTS) {
+        attempts++;
+
+        const remaining = targetCount - results.length;
+        const batchSize = Math.min(POOL_BATCH, remaining);
+
+        const batch = await generateTipsBatch(
+            tipType,
+            petType,
+            ageRange,
+            Array.from(seenTitles),
+            batchSize
+        );
+
+        if (!Array.isArray(batch) || batch.length === 0) {
+            await new Promise(r => setTimeout(r, 200 * attempts));
+            continue;
+        }
+
+        for (const tip of batch) {
+            if (!tip?.title) continue;
+
+            const key = tip.title.trim().toLowerCase();
+            if (seenTitles.has(key)) continue;
+
+            seenTitles.add(key);
+            results.push(tip);
+
+            if (results.length >= targetCount) break;
+        }
+    }
+
+    return {
+        tips: results,
+        complete: results.length >= targetCount,
+        attempts,
+    };
+}
+
+app.post("/pet/tips/pool", async (req, res) => {
+    try {
+        const { petType, ageRange, tipType, needed = POOL_SIZE, existingTitles = [] } = req.body || {};
+
+        if (!petType || !ageRange || !tipType) {
+            return res.status(400).json({ ok: false, error: "MISSING_PARAMS" });
+        }
+
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
+
+        const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
+
+        // ─────────────────────────────
+        // 1. FETCH FROM CACHE (DB)
+        // ─────────────────────────────
+        const { data: existing, error: fetchErr } = await supabase
+            .from("pet_tips_pool")
+            .select("id, title, content")
+            .eq("pet_type", petType)
+            .eq("age_range", ageRange)
+            .eq("tip_type", tipType)
+            .limit(POOL_SIZE);
+
+        if (fetchErr) throw fetchErr;
+
+        const existingInDb = existing || [];
+
+        const clientMissingFromDb = existingInDb.filter(
+            t => !existingTitles.includes(t.title)
+        );
+
+        // ✅ If we already have enough → return instantly
+        if (clientMissingFromDb.length >= needed) {
+            return res.json({
+                ok: true,
+                tips: clientMissingFromDb.slice(0, needed).map(t => ({
+                    id: t.id,
+                    title: t.title,
+                    ...t.content,
+                })),
+                fromCache: true,
+            });
+        }
+
+        // ─────────────────────────────
+        // 2. PREP GENERATION
+        // ─────────────────────────────
+        const allExistingTitles = [
+            ...new Set([
+                ...existingTitles,
+                ...existingInDb.map(t => t.title),
+            ]),
+        ];
+
+        const toGenerate = Math.min(
+            needed - clientMissingFromDb.length,
+            POOL_SIZE - allExistingTitles.length
+        );
+
+        if (toGenerate <= 0) {
+            return res.json({
+                ok: true,
+                tips: clientMissingFromDb.map(t => ({
+                    id: t.id,
+                    title: t.title,
+                    ...t.content,
+                })),
+                fromCache: true,
+            });
+        }
+
+        // ─────────────────────────────
+        // 3. GENERATE (SMART + SAFE)
+        // ─────────────────────────────
+        const { tips: newTips, complete, attempts } = await generateTipsSmart({
+            tipType,
+            petType,
+            ageRange,
+            existingTitles: allExistingTitles,
+            targetCount: toGenerate,
+        });
+
+        console.log("[TIPS GEN]", {
+            requested: toGenerate,
+            received: newTips.length,
+            complete,
+            attempts,
+        });
+
+        // ❗ If nothing generated, fallback to cache only
+        if (!newTips.length) {
+            return res.json({
+                ok: true,
+                tips: clientMissingFromDb.map(t => ({
+                    id: t.id,
+                    title: t.title,
+                    ...t.content,
+                })),
+                fromCache: true,
+                warning: "GENERATION_FAILED",
+            });
+        }
+
+        // ─────────────────────────────
+        // 4. SAVE TO DB (CACHE)
+        // ─────────────────────────────
+        const toInsert = newTips
+            .filter(tip => tip?.title)
+            .map(tip => ({
+                pet_type: petType,
+                age_range: ageRange,
+                tip_type: tipType,
+                title: tip.title,
+                content: {
+                    description: tip.description || "",
+                    steps: tip.steps || [],
+                    why: tip.why || "",
+                    difficulty: tip.difficulty || "Easy",
+                },
+            }));
+
+        let inserted = [];
+        if (toInsert.length > 0) {
+            const { data: insertedData } = await supabase
+                .from("pet_tips_pool")
+                .upsert(toInsert, {
+                    onConflict: "pet_type,age_range,tip_type,title",
+                    ignoreDuplicates: true,
+                })
+                .select("id, title, content");
+
+            inserted = insertedData || [];
+        }
+
+        // ─────────────────────────────
+        // 5. SPEND CREDIT (ONLY NOW ✅)
+        // ─────────────────────────────
+        let spend = null;
+        if (!isPro) {
+            spend = await sbSpendCredits(identityId, 1);
+            if (!spend.ok) {
+                return res.status(402).json({ ok: false, error: "NO_CREDITS" });
+            }
+        }
+
+        // ─────────────────────────────
+        // 6. RETURN COMBINED RESULTS
+        // ─────────────────────────────
+        const allTips = [
+            ...clientMissingFromDb.map(t => ({
+                id: t.id,
+                title: t.title,
+                ...t.content,
+            })),
+            ...inserted.map(t => ({
+                id: t.id,
+                title: t.title,
+                ...t.content,
+            })),
+        ];
+
+        return res.json({
+            ok: true,
+            tips: allTips,
+            fromCache: false,
+            creditsRemaining: spend?.remainingPro ?? null,
+        });
+
+    } catch (e) {
+        console.error("pet tips pool error", e?.message || e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    }
+});
+
 app.post("/pet/training", async (req, res) => {
     try {
         const { petType, breed, age, name, previousTitles } = req.body || {};
