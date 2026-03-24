@@ -36,6 +36,9 @@ const CONFIG = {
     RC_CACHE_TTL_MS: 60 * 1000,
 
     FORCE_NOT_PRO: process.env.FORCE_NOT_PRO === "true",
+
+    AD_CREDITS_PER_WATCH: Number(process.env.AD_CREDITS_PER_WATCH || 3),
+    AD_MAX_PER_DAY: Number(process.env.AD_MAX_PER_DAY || 3),
 };
 
 const SUBSCRIPTIONS_ENABLED = true;
@@ -52,6 +55,7 @@ const PORT = process.env.PORT || 8787;
 const rcCache = new Map();
 const subjectCache = new Map();
 
+const utcDayKey = () => new Date().toISOString().slice(0, 10);
 const cleanLabel = (l) => String(l || "").trim().toLowerCase();
 const isValidLabel = (l) => /^[a-z]{2,24}$/.test(l);
 
@@ -616,16 +620,40 @@ app.post("/ads/reward-credit", async (req, res) => {
         if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
         if (!isValidIdentityId(identityId)) return res.status(400).json({ ok: false, error: "INVALID_IDENTITY_ID" });
 
-        const amount = Math.max(1, Number(req.body?.amount) || 1);
-        const source = String(req.body?.source || "paywall").trim();
+        const source = String(req.body?.source || "adGate").trim();
+        const today = utcDayKey();
 
-        const granted = await sbGrantCredits(identityId, amount);
+        // Check daily ad limit
+        const { data: row } = await supabase
+            .from("device_usage")
+            .select("ad_credits_today, ad_credits_date")
+            .eq("device_id", identityId)
+            .maybeSingle();
 
-        console.log("[ADS REWARD CREDIT]", { identityId, amount, source, remainingPro: granted.remainingPro });
+        const isToday = row?.ad_credits_date === today;
+        const adsToday = isToday ? (row?.ad_credits_today ?? 0) : 0;
+
+        if (adsToday >= CONFIG.AD_MAX_PER_DAY) {
+            console.log("[ADS] daily limit reached", { identityId, adsToday });
+            return res.json({ ok: false, error: "DAILY_AD_LIMIT_REACHED", adsToday });
+        }
+
+        // Grant credits
+        const granted = await sbGrantCredits(identityId, CONFIG.AD_CREDITS_PER_WATCH);
+
+        // Update daily counter
+        await supabase
+            .from("device_usage")
+            .update({ ad_credits_today: adsToday + 1, ad_credits_date: today })
+            .eq("device_id", identityId);
+
+        console.log("[ADS REWARD CREDIT]", { identityId, source, adsToday: adsToday + 1, creditsGranted: CONFIG.AD_CREDITS_PER_WATCH });
 
         return res.json({
             ok: true,
             source,
+            adsToday: adsToday + 1,
+            adsRemaining: CONFIG.AD_MAX_PER_DAY - (adsToday + 1),
             creditsRemaining: granted.remainingPro,
             creditsTotal: granted.proTokens,
             creditsUsed: granted.proUsed,
@@ -1006,20 +1034,6 @@ app.post("/pet/training", async (req, res) => {
     try {
         const { petType, breed, age, name, previousTitles } = req.body || {};
 
-        const identityId = await resolveIdentityId(req);
-        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
-
-        const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
-
-        // Spend a credit if not pro
-        let spend = null;
-        if (!isPro) {
-            spend = await sbSpendCredits(identityId, 1);
-            if (!spend.ok) {
-                return res.status(402).json({ ok: false, error: "NO_CREDITS" });
-            }
-        }
-
         const avoidLine = Array.isArray(previousTitles) && previousTitles.length
             ? `\nDo NOT suggest any of these as they have already been shown: ${previousTitles.join(", ")}.`
             : "";
@@ -1078,7 +1092,7 @@ app.post("/pet/training", async (req, res) => {
         });
 
         const result = JSON.parse(r.output_text || "{}");
-        return res.json({ ok: true, result, creditsRemaining: spend?.remainingPro ?? null });
+        return res.json({ ok: true, result });
     } catch (e) {
         console.error("training tip error", e);
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
@@ -1088,20 +1102,6 @@ app.post("/pet/training", async (req, res) => {
 app.post("/pet/activity", async (req, res) => {
     try {
         const { petType, breed, age, name, previousTitles } = req.body || {};
-
-        const identityId = await resolveIdentityId(req);
-        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
-
-        const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
-
-        // Spend a credit if not pro
-        let spend = null;
-        if (!isPro) {
-            spend = await sbSpendCredits(identityId, 1);
-            if (!spend.ok) {
-                return res.status(402).json({ ok: false, error: "NO_CREDITS" });
-            }
-        }
 
         const avoidLine = Array.isArray(previousTitles) && previousTitles.length
             ? `\nDo NOT suggest any of these as they have already been shown: ${previousTitles.join(", ")}.`
@@ -1162,7 +1162,7 @@ app.post("/pet/activity", async (req, res) => {
         });
 
         const result = JSON.parse(r.output_text || "{}");
-        return res.json({ ok: true, result, creditsRemaining: spend?.remainingPro ?? null });
+        return res.json({ ok: true, result });
     } catch (e) {
         console.error("pet activity error", e);
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
