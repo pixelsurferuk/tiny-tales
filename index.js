@@ -36,9 +36,6 @@ const CONFIG = {
     RC_CACHE_TTL_MS: 60 * 1000,
 
     FORCE_NOT_PRO: process.env.FORCE_NOT_PRO === "true",
-
-    AD_CREDITS_PER_WATCH: 3,
-    AD_MAX_PER_DAY: 3,
 };
 
 const SUBSCRIPTIONS_ENABLED = true;
@@ -55,7 +52,6 @@ const PORT = process.env.PORT || 8787;
 const rcCache = new Map();
 const subjectCache = new Map();
 
-const utcDayKey = () => new Date().toISOString().slice(0, 10);
 const cleanLabel = (l) => String(l || "").trim().toLowerCase();
 const isValidLabel = (l) => /^[a-z]{2,24}$/.test(l);
 
@@ -492,6 +488,8 @@ async function generateProThought(label, enrich) {
                     "Must be first-person as the subject in the image. Use I/me/my. " +
                     "No mention of photo/camera/app/user/viewer. " +
                     "Use UK humour/wording. No profanity/hate/sexual content. " +
+                    "Be cheeky, self-important, and slightly dramatic. " +
+                    "The subject has strong opinions and absolutely no self-awareness. " +
                     `Length: ${minW}-${maxW} words. ` +
                     "End with exactly ONE fitting emoji at the very end.",
             },
@@ -539,10 +537,10 @@ function sanitizeAskHistory(history) {
 async function generateAskAnswer({ label, pet, question, history = [] }) {
     const minW = CONFIG.ASK_MIN_WORDS;
     const maxW = CONFIG.ASK_MAX_WORDS;
+    const memory = String(pet?.memory || "").trim();
 
     const petName = String(pet?.name || "my pet").trim() || "my pet";
     const vibe = String(pet?.vibe || "").trim();
-    const memory = String(pet?.memory || "").trim();
     const safeHistory = sanitizeAskHistory(history);
 
     const r = await client.responses.create({
@@ -556,15 +554,16 @@ Write exactly like a ${label} texting their owner.
 You are not an assistant. You are not helpful. You are opinionated.
 
 Reply in first person (I/me/my).
-Short, chatty, playful, slightly dramatic. UK humour.
+Short, chatty, playful. UK humour.
 Natural texting tone, not polished writing.
 
 Be expressive. React strongly. Have opinions.
 Tease, exaggerate, sulk, brag, or act offended if it fits.
-Be cheeky, self-important, and slightly dramatic.
-The subject has strong opinions and absolutely no self-awareness.
 
-Reference earlier parts of the conversation naturally when relevant.
+If the user tells you something specific about themselves or asks you to remember something, acknowledge it naturally and refer back to it later in the conversation. 
+You have a consistent memory within this conversation. 
+
+Reference earlier parts of the conversation naturally when relevant. 
 You have a consistent personality and remember what was said.
 
 Do NOT:
@@ -585,7 +584,7 @@ Only ask a question in about 1 in 4 replies.
 Family friendly only.
 
 Length: ${minW}-${maxW} words.
-Sometimes end with exactly ONE fitting emoji.`,
+Sometimes end with exactly ONE fitting emoji.`
             },
             ...(vibe
                 ? [{ role: "system", content: `Personality notes (how you talk): ${vibe}` }]
@@ -611,46 +610,22 @@ Sometimes end with exactly ONE fitting emoji.`,
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ─── Ads: reward credit with daily limit ──────────────────────────────────────
-
 app.post("/ads/reward-credit", async (req, res) => {
     try {
         const identityId = await resolveIdentityId(req);
         if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
         if (!isValidIdentityId(identityId)) return res.status(400).json({ ok: false, error: "INVALID_IDENTITY_ID" });
 
-        const today = utcDayKey();
+        const amount = Math.max(1, Number(req.body?.amount) || 1);
+        const source = String(req.body?.source || "paywall").trim();
 
-        // Check daily ad limit
-        const { data: row } = await supabase
-            .from("device_usage")
-            .select("ad_credits_today, ad_credits_date")
-            .eq("device_id", identityId)
-            .maybeSingle();
+        const granted = await sbGrantCredits(identityId, amount);
 
-        const isToday = row?.ad_credits_date === today;
-        const adsToday = isToday ? (row?.ad_credits_today ?? 0) : 0;
-
-        if (adsToday >= CONFIG.AD_MAX_PER_DAY) {
-            console.log("[ADS] daily limit reached", { identityId, adsToday });
-            return res.json({ ok: false, error: "DAILY_AD_LIMIT_REACHED", adsToday });
-        }
-
-        // Grant credits
-        const granted = await sbGrantCredits(identityId, CONFIG.AD_CREDITS_PER_WATCH);
-
-        // Update daily counter
-        await supabase
-            .from("device_usage")
-            .update({ ad_credits_today: adsToday + 1, ad_credits_date: today })
-            .eq("device_id", identityId);
-
-        console.log("[ADS REWARD CREDIT]", { identityId, adsToday: adsToday + 1, creditsGranted: CONFIG.AD_CREDITS_PER_WATCH });
+        console.log("[ADS REWARD CREDIT]", { identityId, amount, source, remainingPro: granted.remainingPro });
 
         return res.json({
             ok: true,
-            adsToday: adsToday + 1,
-            adsRemaining: CONFIG.AD_MAX_PER_DAY - (adsToday + 1),
+            source,
             creditsRemaining: granted.remainingPro,
             creditsTotal: granted.proTokens,
             creditsUsed: granted.proUsed,
@@ -1027,38 +1002,13 @@ app.post("/auth/transfer-credits", async (req, res) => {
     }
 });
 
-app.post("/ads/status", async (req, res) => {
-    try {
-        const identityId = await resolveIdentityId(req);
-        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
-
-        const today = utcDayKey();
-        const { data: row } = await supabase
-            .from("device_usage")
-            .select("ad_credits_today, ad_credits_date")
-            .eq("device_id", identityId)
-            .maybeSingle();
-
-        const isToday = row?.ad_credits_date === today;
-        const adsToday = isToday ? (row?.ad_credits_today ?? 0) : 0;
-
-        return res.json({
-            ok: true,
-            adsToday,
-            adsRemaining: Math.max(0, CONFIG.AD_MAX_PER_DAY - adsToday),
-            limitReached: adsToday >= CONFIG.AD_MAX_PER_DAY,
-        });
-    } catch (e) {
-        console.error("ad status error", e);
-        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
-    }
-});
-
-// ─── Add these two endpoints to index.js (before app.listen) ─────────────────
-
 app.post("/pet/training", async (req, res) => {
     try {
-        const { petType, breed, age, name } = req.body || {};
+        const { petType, breed, age, name, previousTitles } = req.body || {};
+
+        const avoidLine = Array.isArray(previousTitles) && previousTitles.length
+            ? `\nDo NOT suggest any of these as they have already been shown: ${previousTitles.join(", ")}.`
+            : "";
 
         const petDesc = [
             name ? `named ${name}` : null,
@@ -1080,7 +1030,7 @@ app.post("/pet/training", async (req, res) => {
                 {
                     role: "user",
                     content:
-                        `Generate a training tip for a ${petDesc}.\n` +
+                        `Generate a training tip for a ${petDesc}.${avoidLine}\n` +
                         `Return JSON with:\n` +
                         `{\n` +
                         `  "title": "Short tip name",\n` +
@@ -1123,7 +1073,11 @@ app.post("/pet/training", async (req, res) => {
 
 app.post("/pet/activity", async (req, res) => {
     try {
-        const { petType, breed, age, name } = req.body || {};
+        const { petType, breed, age, name, previousTitles } = req.body || {};
+
+        const avoidLine = Array.isArray(previousTitles) && previousTitles.length
+            ? `\nDo NOT suggest any of these as they have already been shown: ${previousTitles.join(", ")}.`
+            : "";
 
         const petDesc = [
             name ? `named ${name}` : null,
@@ -1146,7 +1100,7 @@ app.post("/pet/activity", async (req, res) => {
                 {
                     role: "user",
                     content:
-                        `Generate a mental stimulation brain game for a ${petDesc}.\n` +
+                        `Generate a mental stimulation brain game for a ${petDesc}.${avoidLine}\n` +
                         `Return JSON with:\n` +
                         `{\n` +
                         `  "title": "Game name",\n` +
