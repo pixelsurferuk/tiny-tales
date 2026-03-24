@@ -1006,6 +1006,20 @@ app.post("/pet/training", async (req, res) => {
     try {
         const { petType, breed, age, name, previousTitles } = req.body || {};
 
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
+
+        const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
+
+        // Spend a credit if not pro
+        let spend = null;
+        if (!isPro) {
+            spend = await sbSpendCredits(identityId, 1);
+            if (!spend.ok) {
+                return res.status(402).json({ ok: false, error: "NO_CREDITS" });
+            }
+        }
+
         const avoidLine = Array.isArray(previousTitles) && previousTitles.length
             ? `\nDo NOT suggest any of these as they have already been shown: ${previousTitles.join(", ")}.`
             : "";
@@ -1064,7 +1078,7 @@ app.post("/pet/training", async (req, res) => {
         });
 
         const result = JSON.parse(r.output_text || "{}");
-        return res.json({ ok: true, result });
+        return res.json({ ok: true, result, creditsRemaining: spend?.remainingPro ?? null });
     } catch (e) {
         console.error("training tip error", e);
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
@@ -1074,6 +1088,20 @@ app.post("/pet/training", async (req, res) => {
 app.post("/pet/activity", async (req, res) => {
     try {
         const { petType, breed, age, name, previousTitles } = req.body || {};
+
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
+
+        const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
+
+        // Spend a credit if not pro
+        let spend = null;
+        if (!isPro) {
+            spend = await sbSpendCredits(identityId, 1);
+            if (!spend.ok) {
+                return res.status(402).json({ ok: false, error: "NO_CREDITS" });
+            }
+        }
 
         const avoidLine = Array.isArray(previousTitles) && previousTitles.length
             ? `\nDo NOT suggest any of these as they have already been shown: ${previousTitles.join(", ")}.`
@@ -1134,7 +1162,7 @@ app.post("/pet/activity", async (req, res) => {
         });
 
         const result = JSON.parse(r.output_text || "{}");
-        return res.json({ ok: true, result });
+        return res.json({ ok: true, result, creditsRemaining: spend?.remainingPro ?? null });
     } catch (e) {
         console.error("pet activity error", e);
         return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
