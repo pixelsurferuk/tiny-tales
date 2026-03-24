@@ -1110,7 +1110,7 @@ async function generateTipsBatch(tipType, petType, ageRange, existingTitles, bat
 
 app.post("/pet/tips/pool", async (req, res) => {
     try {
-        const { petType, ageRange, tipType, needed = POOL_SIZE, existingTitles = [] } = req.body || {};
+        const { petType, ageRange, tipType, needed = POOL_SIZE, existingTitles = [], forceCredit = false } = req.body || {};
 
         if (!petType || !ageRange || !tipType) {
             return res.status(400).json({ ok: false, error: "MISSING_PARAMS" });
@@ -1127,12 +1127,8 @@ app.post("/pet/tips/pool", async (req, res) => {
             if (status.remainingPro <= 0) return res.status(402).json({ ok: false, error: "NO_CREDITS" });
         }
 
-        // Spend 1 credit upfront — whether from cache or freshly generated
+        // spend is set conditionally below based on forceCredit and cache state
         let spend = null;
-        if (!isPro) {
-            spend = await sbSpendCredits(identityId, 1);
-            if (!spend.ok) return res.status(402).json({ ok: false, error: "NO_CREDITS" });
-        }
 
         // Check if pool already has enough in DB
         const { data: existing, error: fetchErr } = await supabase
@@ -1153,6 +1149,27 @@ app.post("/pet/tips/pool", async (req, res) => {
 
         // Return DB tips the client doesn't have yet
         const clientMissingFromDb = existingInDb.filter(t => !existingTitles.includes(t.title));
+        if (clientMissingFromDb.length >= needed && !forceCredit) {
+            // Enough cached tips and no forced credit spend — return free
+            return res.json({
+                ok: true,
+                tips: clientMissingFromDb.slice(0, needed).map(t => ({
+                    id: t.id,
+                    ...t.content,
+                    title: t.title,
+                })),
+                fromCache: true,
+                creditsRemaining: null,
+            });
+        }
+
+        // Spend credit — either forced (first ever open) or generating new tips
+        if (!isPro) {
+            spend = await sbSpendCredits(identityId, 1);
+            if (!spend.ok) return res.status(402).json({ ok: false, error: "NO_CREDITS" });
+        }
+
+        // If we have enough cached tips after spending — return them
         if (clientMissingFromDb.length >= needed) {
             return res.json({
                 ok: true,
