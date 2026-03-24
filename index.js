@@ -1127,6 +1127,13 @@ app.post("/pet/tips/pool", async (req, res) => {
             if (status.remainingPro <= 0) return res.status(402).json({ ok: false, error: "NO_CREDITS" });
         }
 
+        // Spend 1 credit upfront — whether from cache or freshly generated
+        let spend = null;
+        if (!isPro) {
+            spend = await sbSpendCredits(identityId, 1);
+            if (!spend.ok) return res.status(402).json({ ok: false, error: "NO_CREDITS" });
+        }
+
         // Check if pool already has enough in DB
         const { data: existing, error: fetchErr } = await supabase
             .from("pet_tips_pool")
@@ -1155,6 +1162,7 @@ app.post("/pet/tips/pool", async (req, res) => {
                     title: t.title,
                 })),
                 fromCache: true,
+                creditsRemaining: spend?.remainingPro ?? null,
             });
         }
 
@@ -1169,14 +1177,8 @@ app.post("/pet/tips/pool", async (req, res) => {
                 ok: true,
                 tips: clientMissingFromDb.map(t => ({ id: t.id, ...t.content, title: t.title })),
                 fromCache: true,
+                creditsRemaining: spend?.remainingPro ?? null,
             });
-        }
-
-        // Spend 1 credit for the generation call
-        let spend = null;
-        if (!isPro) {
-            spend = await sbSpendCredits(identityId, 1);
-            if (!spend.ok) return res.status(402).json({ ok: false, error: "NO_CREDITS" });
         }
 
         const newTips = await generateTipsBatch(tipType, petType, ageRange, allExistingTitles, toGenerate);
