@@ -1010,6 +1010,33 @@ app.post("/credits/grant", async (req, res) => {
     }
 });
 
+app.post("/ads/status", async (req, res) => {
+    try {
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
+
+        const today = utcDayKey();
+        const { data: row } = await supabase
+            .from("device_usage")
+            .select("ad_credits_today, ad_credits_date")
+            .eq("device_id", identityId)
+            .maybeSingle();
+
+        const isToday = row?.ad_credits_date === today;
+        const adsToday = isToday ? (row?.ad_credits_today ?? 0) : 0;
+
+        return res.json({
+            ok: true,
+            adsToday,
+            adsRemaining: Math.max(0, CONFIG.AD_MAX_PER_DAY - adsToday),
+            limitReached: adsToday >= CONFIG.AD_MAX_PER_DAY,
+        });
+    } catch (e) {
+        console.error("ad status error", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    }
+});
+
 app.post("/auth/transfer-credits", async (req, res) => {
     try {
         console.log("[transfer-credits] called", { guestId: req.body?.guestId, userId: req.body?.userId });
