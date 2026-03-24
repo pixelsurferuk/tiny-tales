@@ -1074,23 +1074,6 @@ async function withRetry(fn, retries = 2, delayMs = 800) {
     }
 }
 
-async function withRetry(fn, retries = 2, delayMs = 800) {
-    for (let i = 0; i <= retries; i++) {
-        try {
-            return await fn();
-        } catch (e) {
-            const isCapacity = String(e?.message || "").toLowerCase().includes("over capacity") ||
-                String(e?.message || "").toLowerCase().includes("503") ||
-                e?.status === 503;
-            if (isCapacity && i < retries) {
-                await new Promise(r => setTimeout(r, delayMs * Math.pow(2, i)));
-                continue;
-            }
-            throw e;
-        }
-    }
-}
-
 // ─── Pet Tips Pool ────────────────────────────────────────────────────────────
 
 async function generateTipsSmart({
