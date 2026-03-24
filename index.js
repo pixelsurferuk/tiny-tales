@@ -37,8 +37,8 @@ const CONFIG = {
 
     FORCE_NOT_PRO: process.env.FORCE_NOT_PRO === "true",
 
-    AD_CREDITS_PER_WATCH: Number(process.env.AD_CREDITS_PER_WATCH || 3),
-    AD_MAX_PER_DAY: Number(process.env.AD_MAX_PER_DAY || 3),
+    AD_CREDITS_PER_WATCH: Number(process.env.AD_CREDITS_PER_WATCH || 2),
+    AD_MAX_PER_DAY: Number(process.env.AD_MAX_PER_DAY || 5),
 };
 
 const SUBSCRIPTIONS_ENABLED = true;
