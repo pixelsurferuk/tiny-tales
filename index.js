@@ -23,7 +23,7 @@ const CONFIG = {
     THOUGHT_MODEL:  "meta-llama/llama-4-scout-17b-16e-instruct",
 
     DEFAULT_GUEST_PRO_BALANCE: Number(process.env.DEFAULT_GUEST_PRO_BALANCE || 3),
-    DEFAULT_USER_PRO_BALANCE: Number(process.env.DEFAULT_USER_PRO_BALANCE || 3),
+    DEFAULT_USER_PRO_BALANCE: Number(process.env.DEFAULT_USER_PRO_BALANCE || 0),
 
     SUBJECT_CACHE_TTL_MS: 10 * 60 * 1000,
     SUBJECT_CACHE_MAX: 2000,
@@ -1024,6 +1024,33 @@ app.post("/auth/transfer-credits", async (req, res) => {
     } catch (e) {
         console.warn("[transfer-credits]", e?.message);
         res.json({ ok: false, error: e?.message });
+    }
+});
+
+app.post("/ads/status", async (req, res) => {
+    try {
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
+
+        const today = utcDayKey();
+        const { data: row } = await supabase
+            .from("device_usage")
+            .select("ad_credits_today, ad_credits_date")
+            .eq("device_id", identityId)
+            .maybeSingle();
+
+        const isToday = row?.ad_credits_date === today;
+        const adsToday = isToday ? (row?.ad_credits_today ?? 0) : 0;
+
+        return res.json({
+            ok: true,
+            adsToday,
+            adsRemaining: Math.max(0, CONFIG.AD_MAX_PER_DAY - adsToday),
+            limitReached: adsToday >= CONFIG.AD_MAX_PER_DAY,
+        });
+    } catch (e) {
+        console.error("ad status error", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
     }
 });
 
