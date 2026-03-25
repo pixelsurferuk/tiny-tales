@@ -1444,6 +1444,241 @@ app.post("/sync/pull", async (req, res) => {
     }
 });
 
+// ─── Pet Challenge Club ───────────────────────────────────────────────────────
+
+const CHALLENGE_POOL_SIZE = 30;
+const CHALLENGE_BATCH = 5;
+
+async function generateChallengesBatch(petType, ageRange, existingTitles, batchSize) {
+    const avoidLine = existingTitles.length
+        ? `\nDo NOT generate any of these: ${existingTitles.join(", ")}.`
+        : "";
+
+    const r = await withRetry(() => client.chat.completions.create({
+        model: CONFIG.THOUGHT_MODEL,
+        messages: [
+            {
+                role: "system",
+                content:
+                    "You are a pet behaviour expert. Generate fun, practical daily challenges for pet owners to do with their pets. " +
+                    "Challenges should take 5-15 minutes, use no special equipment, and strengthen the human-pet bond. " +
+                    "Return JSON only. Family friendly.",
+            },
+            {
+                role: "user",
+                content:
+                    `Generate ${batchSize} DIFFERENT daily challenges for a ${ageRange} ${petType}.${avoidLine}\n` +
+                    `Return a JSON object:\n` +
+                    `{"challenges":[{"title":"...","description":"...","instructions":["step1","step2","step3"],"why":"...","difficulty":"Easy|Medium|Challenging","category":"training|enrichment|bonding|exercise"}]}`,
+            },
+        ],
+        response_format: { type: "json_object" },
+        max_tokens: 2000,
+    }));
+
+    const raw = r.choices?.[0]?.message?.content || "{}";
+    const parsed = JSON.parse(raw);
+    const challenges = parsed.challenges || parsed.items || Object.values(parsed)[0] || [];
+    return Array.isArray(challenges) ? challenges : [];
+}
+
+app.post("/challenge/today", async (req, res) => {
+    try {
+        const { petId, petType, ageRange } = req.body || {};
+        if (!petId || !petType || !ageRange) {
+            return res.status(400).json({ ok: false, error: "MISSING_PARAMS" });
+        }
+
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
+
+        const today = utcDayKey();
+
+        // Check if already assigned today
+        const { data: existing } = await supabase
+            .from("pet_challenge_progress")
+            .select("id, challenge_id, completed_at, reaction")
+            .eq("identity_id", identityId)
+            .eq("pet_id", petId)
+            .eq("challenge_date", today)
+            .maybeSingle();
+
+        if (existing?.challenge_id) {
+            const { data: challenge } = await supabase
+                .from("pet_challenges_pool")
+                .select("*")
+                .eq("id", existing.challenge_id)
+                .maybeSingle();
+
+            return res.json({
+                ok: true,
+                challenge: { ...challenge, instructions: challenge?.instructions || [] },
+                completedAt: existing.completed_at,
+                reaction: existing.reaction,
+            });
+        }
+
+        // Get pool for this petType + ageRange
+        let { data: pool } = await supabase
+            .from("pet_challenges_pool")
+            .select("id, title, description, instructions, why, difficulty, category")
+            .eq("pet_type", petType)
+            .eq("age_range", ageRange)
+            .limit(CHALLENGE_POOL_SIZE);
+
+        pool = pool || [];
+
+        // Get recently seen challenges for this user+pet (last 30 days)
+        const { data: recent } = await supabase
+            .from("pet_challenge_progress")
+            .select("challenge_id")
+            .eq("identity_id", identityId)
+            .eq("pet_id", petId)
+            .order("challenge_date", { ascending: false })
+            .limit(30);
+
+        const recentIds = new Set((recent || []).map(r => r.challenge_id));
+        const unseen = pool.filter(c => !recentIds.has(c.id));
+
+        let todayChallenge = unseen.length > 0
+            ? unseen[Math.floor(Math.random() * unseen.length)]
+            : pool[Math.floor(Math.random() * pool.length)]; // fallback to any
+
+        // Generate more if pool is small
+        if (pool.length < 10) {
+            const existingTitles = pool.map(c => c.title);
+            try {
+                const newChallenges = await generateChallengesBatch(petType, ageRange, existingTitles, CHALLENGE_BATCH);
+                const toInsert = newChallenges.filter(c => c?.title).map(c => ({
+                    pet_type: petType,
+                    age_range: ageRange,
+                    title: c.title,
+                    description: c.description || "",
+                    instructions: c.instructions || [],
+                    why: c.why || "",
+                    difficulty: c.difficulty || "Easy",
+                    category: c.category || "general",
+                }));
+                if (toInsert.length > 0) {
+                    const { data: inserted } = await supabase
+                        .from("pet_challenges_pool")
+                        .upsert(toInsert, { onConflict: "pet_type,age_range,title", ignoreDuplicates: true })
+                        .select("id, title, description, instructions, why, difficulty, category");
+
+                    if (!todayChallenge && inserted?.length > 0) {
+                        todayChallenge = inserted[0];
+                    }
+                }
+            } catch (e) {
+                console.warn("[challenge] generate failed", e?.message);
+            }
+        }
+
+        if (!todayChallenge) {
+            return res.status(500).json({ ok: false, error: "NO_CHALLENGE_AVAILABLE" });
+        }
+
+        // Assign today's challenge
+        await supabase.from("pet_challenge_progress").upsert({
+            identity_id: identityId,
+            pet_id: petId,
+            challenge_id: todayChallenge.id,
+            challenge_date: today,
+        }, { onConflict: "identity_id,pet_id,challenge_date" });
+
+        console.log("[CHALLENGE TODAY]", { identityId, petId, petType, ageRange });
+        return res.json({
+            ok: true,
+            challenge: { ...todayChallenge, instructions: todayChallenge.instructions || [] },
+        });
+    } catch (e) {
+        console.error("challenge today error", e?.message || e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    }
+});
+
+app.post("/challenge/complete", async (req, res) => {
+    try {
+        const { petId, challengeId, pet } = req.body || {};
+        if (!petId || !challengeId) {
+            return res.status(400).json({ ok: false, error: "MISSING_PARAMS" });
+        }
+
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
+
+        const today = utcDayKey();
+
+        // Get the challenge for context
+        const { data: challenge } = await supabase
+            .from("pet_challenges_pool")
+            .select("title, description")
+            .eq("id", challengeId)
+            .maybeSingle();
+
+        // Generate pet reaction
+        const petName = String(pet?.name || "your pet").trim();
+        const petType = String(pet?.petType || "pet").trim();
+        const vibe = String(pet?.vibe || "").trim();
+
+        const r = await withRetry(() => client.chat.completions.create({
+            model: CONFIG.THOUGHT_MODEL,
+            messages: [
+                {
+                    role: "system",
+                    content:
+                        `You are ${petName}, a ${petType}. React to your owner completing a challenge with you today. ` +
+                        `Be funny, in character, first person. Short (15-30 words). UK humour. ` +
+                        `${vibe ? `Your personality: ${vibe}. ` : ""}` +
+                        `End with one emoji. Family friendly. No profanity.`,
+                },
+                {
+                    role: "user",
+                    content: `We just did: "${challenge?.title || "a challenge"}". React as ${petName}!`,
+                },
+            ],
+            max_tokens: 120,
+        }));
+
+        const reaction = stripLinePrefix((r.choices?.[0]?.message?.content || "").trim());
+
+        // Mark complete
+        const { data: progress } = await supabase
+            .from("pet_challenge_progress")
+            .select("streak_count")
+            .eq("identity_id", identityId)
+            .eq("pet_id", petId)
+            .order("challenge_date", { ascending: false })
+            .limit(2);
+
+        // Calculate streak server-side too
+        const yesterday = new Date();
+        yesterday.setDate(yesterday.getDate() - 1);
+        const yesterdayKey = yesterday.toISOString().slice(0, 10);
+
+        const yesterdayRow = (progress || []).find(p => p.challenge_date === yesterdayKey);
+        const prevStreak = yesterdayRow?.streak_count ?? 0;
+        const newStreak = prevStreak + 1;
+
+        await supabase
+            .from("pet_challenge_progress")
+            .update({
+                completed_at: new Date().toISOString(),
+                reaction,
+                streak_count: newStreak,
+            })
+            .eq("identity_id", identityId)
+            .eq("pet_id", petId)
+            .eq("challenge_date", today);
+
+        console.log("[CHALLENGE COMPLETE]", { identityId, petId, streak: newStreak });
+        return res.json({ ok: true, reaction, streak: newStreak });
+    } catch (e) {
+        console.error("challenge complete error", e?.message || e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
