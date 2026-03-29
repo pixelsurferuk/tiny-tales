@@ -1144,8 +1144,9 @@ app.post("/pet/tips/pool", async (req, res) => {
 
         const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
 
-        // Check credits
-        if (!isPro) {
+        // Only check/spend credits when forceCredit=true (user requesting a new tip)
+        // forceCredit=false is a free pool restore (e.g. after sync/reinstall)
+        if (!isPro && forceCredit) {
             const status = await sbGetStatus(identityId);
             if (status.remainingPro <= 0) return res.status(402).json({ ok: false, error: "NO_CREDITS" });
         }
