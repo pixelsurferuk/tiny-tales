@@ -37,8 +37,8 @@ const CONFIG = {
 
     FORCE_NOT_PRO: process.env.FORCE_NOT_PRO === "true",
 
-    AD_CREDITS_PER_WATCH: Number(process.env.AD_CREDITS_PER_WATCH || 2),
-    AD_MAX_PER_DAY: Number(process.env.AD_MAX_PER_DAY || 5),
+    AD_CREDITS_PER_WATCH: Number(process.env.AD_CREDITS_PER_WATCH || 3),
+    AD_MAX_PER_DAY: Number(process.env.AD_MAX_PER_DAY || 3),
 };
 
 const SUBSCRIPTIONS_ENABLED = true;
@@ -675,6 +675,13 @@ app.post("/status", async (req, res) => {
         const s = await sbGetStatus(identityId);
         const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
 
+        // Fetch trial start date
+        const { data: usage } = await supabase
+            .from("device_usage")
+            .select("challenge_trial_started_at")
+            .eq("device_id", identityId)
+            .maybeSingle();
+
         return res.json({
             ok: true,
             creditsRemaining: s.remainingPro,
@@ -684,6 +691,7 @@ app.post("/status", async (req, res) => {
             proTokens: s.proTokens,
             proUsed: s.proUsed,
             isPro,
+            challengeTrialStartedAt: usage?.challenge_trial_started_at || null,
             source: "supabase+revenuecat",
         });
     } catch (e) {
@@ -1048,6 +1056,21 @@ app.post("/auth/transfer-credits", async (req, res) => {
             p_user_id: userId,
         });
         if (error) throw error;
+
+        // Carry over challenge trial start date so user doesn't get a fresh trial
+        const { data: guestRow } = await supabase
+            .from("device_usage")
+            .select("challenge_trial_started_at")
+            .eq("device_id", guestId)
+            .maybeSingle();
+
+        if (guestRow?.challenge_trial_started_at) {
+            await supabase
+                .from("device_usage")
+                .update({ challenge_trial_started_at: guestRow.challenge_trial_started_at })
+                .eq("device_id", userId)
+                .is("challenge_trial_started_at", null); // don't overwrite if user already has one
+        }
 
         console.log("[transfer-credits] transferred", data, "credits");
         res.json({ ok: true, transferred: data });
@@ -1494,6 +1517,27 @@ app.post("/challenge/today", async (req, res) => {
 
         const today = utcDayKey();
 
+        // Ensure usage row exists
+        await sbEnsureIdentityRow(identityId);
+
+        // Set trial start date if not already set — first time they open a challenge
+        await supabase
+            .from("device_usage")
+            .update({ challenge_trial_started_at: today })
+            .eq("device_id", identityId)
+            .is("challenge_trial_started_at", null);
+
+        // Fetch trial start date to return to client
+        const { data: usageRow } = await supabase
+            .from("device_usage")
+            .select("challenge_trial_started_at")
+            .eq("device_id", identityId)
+            .maybeSingle();
+
+        const trialStartedAt = usageRow?.challenge_trial_started_at
+            ? new Date(usageRow.challenge_trial_started_at).toISOString().slice(0, 10)
+            : today;
+
         // Check if already assigned today
         const { data: existing } = await supabase
             .from("pet_challenge_progress")
@@ -1515,6 +1559,7 @@ app.post("/challenge/today", async (req, res) => {
                 challenge: { ...challenge, instructions: challenge?.instructions || [] },
                 completedAt: existing.completed_at,
                 reaction: existing.reaction,
+                trialStartedAt,
             });
         }
 
@@ -1590,6 +1635,7 @@ app.post("/challenge/today", async (req, res) => {
         return res.json({
             ok: true,
             challenge: { ...todayChallenge, instructions: todayChallenge.instructions || [] },
+            trialStartedAt,
         });
     } catch (e) {
         console.error("challenge today error", e?.message || e);
