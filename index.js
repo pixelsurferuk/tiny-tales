@@ -1692,7 +1692,7 @@ app.post("/challenge/complete", async (req, res) => {
         // Mark complete
         const { data: progress } = await supabase
             .from("pet_challenge_progress")
-            .select("streak_count")
+            .select("streak_count, challenge_date")
             .eq("identity_id", identityId)
             .eq("pet_id", petId)
             .order("challenge_date", { ascending: false })
