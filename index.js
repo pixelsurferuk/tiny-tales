@@ -1417,7 +1417,7 @@ app.post("/sync/push", async (req, res) => {
         const identityId = await resolveIdentityId(req);
         if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
 
-        const { pets, seenTips, clubData } = req.body || {};
+        const { pets, seenTips, clubData, chats } = req.body || {};
 
         const { error } = await supabase
             .from("user_sync")
@@ -1426,6 +1426,7 @@ app.post("/sync/push", async (req, res) => {
                 pets: Array.isArray(pets) ? pets : [],
                 seen_tips: seenTips || {},
                 club_data: clubData || {},
+                chats: chats || {},
             }, { onConflict: "identity_id" });
 
         if (error) throw error;
@@ -1445,7 +1446,7 @@ app.post("/sync/pull", async (req, res) => {
 
         const { data, error } = await supabase
             .from("user_sync")
-            .select("pets, seen_tips, club_data, updated_at")
+            .select("pets, seen_tips, club_data, chats, updated_at")
             .eq("identity_id", identityId)
             .maybeSingle();
 
@@ -1459,6 +1460,7 @@ app.post("/sync/pull", async (req, res) => {
                 pets: data.pets || [],
                 seenTips: data.seen_tips || {},
                 clubData: data.club_data || {},
+                chats: data.chats || {},
                 updatedAt: data.updated_at,
             },
         });
