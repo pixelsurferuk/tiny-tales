@@ -1510,7 +1510,7 @@ async function generateChallengesBatch(petType, ageRange, existingTitles, batchS
 
 app.post("/challenge/today", async (req, res) => {
     try {
-        const { petId, petType, ageRange } = req.body || {};
+        const { petId, petType, ageRange, localDate } = req.body || {};
         if (!petId || !petType || !ageRange) {
             return res.status(400).json({ ok: false, error: "MISSING_PARAMS" });
         }
@@ -1518,7 +1518,12 @@ app.post("/challenge/today", async (req, res) => {
         const identityId = await resolveIdentityId(req);
         if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
 
-        const today = utcDayKey();
+        // Use client's local date so challenges reset at midnight in the user's timezone.
+        // Sanity-check: reject dates more than 1 day away from server UTC to prevent abuse.
+        const serverUtc = utcDayKey();
+        const isValidLocalDate = localDate && /^\d{4}-\d{2}-\d{2}$/.test(localDate)
+            && Math.abs(new Date(localDate) - new Date(serverUtc)) <= 86400000 * 1;
+        const today = isValidLocalDate ? localDate : serverUtc;
 
         // Ensure usage row exists
         await sbEnsureIdentityRow(identityId);
@@ -1648,7 +1653,7 @@ app.post("/challenge/today", async (req, res) => {
 
 app.post("/challenge/complete", async (req, res) => {
     try {
-        const { petId, challengeId, pet } = req.body || {};
+        const { petId, challengeId, pet, localDate } = req.body || {};
         if (!petId || !challengeId) {
             return res.status(400).json({ ok: false, error: "MISSING_PARAMS" });
         }
@@ -1656,7 +1661,11 @@ app.post("/challenge/complete", async (req, res) => {
         const identityId = await resolveIdentityId(req);
         if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
 
-        const today = utcDayKey();
+        // Use client's local date — same logic as /challenge/today
+        const serverUtc = utcDayKey();
+        const isValidLocalDate = localDate && /^\d{4}-\d{2}-\d{2}$/.test(localDate)
+            && Math.abs(new Date(localDate) - new Date(serverUtc)) <= 86400000 * 1;
+        const today = isValidLocalDate ? localDate : serverUtc;
 
         // Get the challenge for context
         const { data: challenge } = await supabase
@@ -1700,8 +1709,8 @@ app.post("/challenge/complete", async (req, res) => {
             .order("challenge_date", { ascending: false })
             .limit(2);
 
-        // Calculate streak server-side too
-        const yesterday = new Date();
+        // Calculate streak server-side too — use local date so yesterday aligns correctly
+        const yesterday = new Date(today);
         yesterday.setDate(yesterday.getDate() - 1);
         const yesterdayKey = yesterday.toISOString().slice(0, 10);
 
