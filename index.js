@@ -621,7 +621,11 @@ app.post("/ads/reward-credit", async (req, res) => {
         if (!isValidIdentityId(identityId)) return res.status(400).json({ ok: false, error: "INVALID_IDENTITY_ID" });
 
         const source = String(req.body?.source || "adGate").trim();
-        const today = utcDayKey();
+        const localDate = req.body?.localDate;
+        const serverUtc = utcDayKey();
+        const isValidLocalDate = localDate && /^\d{4}-\d{2}-\d{2}$/.test(localDate)
+            && Math.abs(new Date(localDate) - new Date(serverUtc)) <= 86400000 * 1;
+        const today = isValidLocalDate ? localDate : serverUtc;
 
         // Check daily ad limit
         const { data: row } = await supabase
@@ -1023,7 +1027,12 @@ app.post("/ads/status", async (req, res) => {
         const identityId = await resolveIdentityId(req);
         if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
 
-        const today = utcDayKey();
+        const localDate = req.body?.localDate;
+        const serverUtc = utcDayKey();
+        const isValidLocalDate = localDate && /^\d{4}-\d{2}-\d{2}$/.test(localDate)
+            && Math.abs(new Date(localDate) - new Date(serverUtc)) <= 86400000 * 1;
+        const today = isValidLocalDate ? localDate : serverUtc;
+
         const { data: row } = await supabase
             .from("device_usage")
             .select("ad_credits_today, ad_credits_date")
