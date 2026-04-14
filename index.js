@@ -499,7 +499,7 @@ async function generateProThought(label, enrich) {
                     "(e) a passive-aggressive observation aimed at someone who definitely deserves it. " +
                     "Be specific to the action, expression, and gaze — generic thoughts are boring and will not be tolerated. " +
                     "Build toward a punchy final line that lands like a punchline. " +
-                    `${minW}–${maxW} words. End with exactly one fitting emoji.`,
+                    `STRICT WORD LIMIT: your entire response must be between ${minW} and ${maxW} words (not counting the emoji). Count before you respond. Do not exceed ${maxW} words under any circumstances. End with exactly one fitting emoji.`,
             },
             {
                 role: "user",
@@ -518,7 +518,7 @@ async function generateProThought(label, enrich) {
                     `Write the inner thought. Ground it in the action + expression + gaze first — the room is just backdrop.`,
             },
         ],
-        max_output_tokens: 160,
+        max_output_tokens: 80,
     });
 
     const out = stripLinePrefix((r.output_text || "").trim());
@@ -584,7 +584,7 @@ Never:
 Ask a follow-up question only in roughly 1 in 4 replies, and only if it's genuinely funny.
 Sometimes end with one fitting emoji — not every time.
 Family friendly only.
-Length: ${minW}–${maxW} words.`
+STRICT WORD LIMIT: your entire response must be between ${minW} and ${maxW} words. Count before you respond. Do not exceed ${maxW} words under any circumstances.`
             },
             ...(vibe
                 ? [{ role: "system", content: `How ${petName} talks and acts: ${vibe}` }]
@@ -599,7 +599,7 @@ Length: ${minW}–${maxW} words.`
                 content: String(question || "").trim(),
             },
         ],
-        max_output_tokens: 180,
+        max_output_tokens: 90,
     });
 
     const out = stripLinePrefix((r.output_text || "").trim());
