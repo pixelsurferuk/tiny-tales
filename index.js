@@ -1018,6 +1018,60 @@ app.post("/credits/grant", async (req, res) => {
     }
 });
 
+// Debit one credit without generating AI content. Used by bundled-content
+// features (tips, brain games, challenges) that still want to cost a credit.
+// Response shape mirrors /ask's credit block so parseCreditsFromResponse /
+// setCreditsLocal on the client work unchanged.
+app.post("/credits/debit", async (req, res) => {
+    try {
+        const identityId = await resolveIdentityId(req);
+        if (!identityId) return res.status(400).json({ ok: false, error: "MISSING_IDENTITY_ID" });
+
+        const reason = typeof req.body?.reason === "string" ? req.body.reason.slice(0, 64) : null;
+        const isPro = SUBSCRIPTIONS_ENABLED ? await validateProWithRevenueCat(identityId) : false;
+
+        if (isPro) {
+            const status = await sbGetStatus(identityId);
+            return res.json({
+                ok: true,
+                isPro: true,
+                reason,
+                creditsRemaining: null,
+                creditsTotal: null,
+                creditsUsed: null,
+                remainingPro: status.remainingPro,
+                proTokens: status.proTokens,
+                proUsed: status.proUsed,
+            });
+        }
+
+        const spend = await sbSpendCredits(identityId, 1);
+        if (!spend.ok) {
+            return res.status(402).json({
+                ok: false,
+                error: "NO_CREDITS",
+                creditsRemaining: spend.remainingPro ?? 0,
+                creditsTotal: spend.proTokens ?? 0,
+                creditsUsed: spend.proUsed ?? 0,
+                requiresSubscription: true,
+                isPro: false,
+            });
+        }
+
+        return res.json({
+            ok: true,
+            isPro: false,
+            reason,
+            creditsRemaining: spend.remainingPro,
+            creditsTotal: spend.proTokens,
+            creditsUsed: spend.proUsed,
+        });
+    } catch (e) {
+        console.error("credits debit error", e);
+        return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    }
+});
+
 app.post("/ads/status", async (req, res) => {
     try {
         const identityId = await resolveIdentityId(req);
