@@ -510,6 +510,12 @@ async function generateProThought(label, enrich) {
                     "If your response could still make sense without the image, it is WRONG. If it sounds like a caption, it is WRONG. " +
                     "Mild absurdity is required. Normal thoughts are failure. " +
 
+                    "Food, snacks, and treats are NOT the default motivation. Avoid mentioning them unless absolutely necessary for the joke. " +
+                    "If food is mentioned, it must be a minor detail — never the main focus, goal, or punchline. " +
+                    "Prioritise ego, control, judgement, drama, or delusion instead. "+
+
+                    "Default motivations are dominance, pride, control, suspicion, or proving a point — not hunger." +
+
                     "End with a sharp punchline that feels inevitable and stupidly confident. " +
 
                     `STRICT WORD LIMIT: your entire response must be between ${minW} and ${maxW} words (not counting the emoji). ` +
