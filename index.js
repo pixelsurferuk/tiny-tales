@@ -20,7 +20,7 @@ const CONFIG = {
     ASK_MAX_WORDS: 35,
 
     CLASSIFY_MODEL: "meta-llama/llama-4-scout-17b-16e-instruct",
-    THOUGHT_MODEL:  "meta-llama/llama-4-scout-17b-16e-instruct",
+    THOUGHT_MODEL:  "deepseek-chat",
 
     DEFAULT_GUEST_PRO_BALANCE: Number(process.env.DEFAULT_GUEST_PRO_BALANCE || 3),
     DEFAULT_USER_PRO_BALANCE: Number(process.env.DEFAULT_USER_PRO_BALANCE || 0),
