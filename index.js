@@ -38,7 +38,7 @@ const CONFIG = {
     FORCE_NOT_PRO: process.env.FORCE_NOT_PRO === "true",
 
     AD_CREDITS_PER_WATCH: Number(process.env.AD_CREDITS_PER_WATCH || 3),
-    AD_MAX_PER_DAY: Number(process.env.AD_MAX_PER_DAY || 3),
+    AD_MAX_PER_DAY: Number(process.env.AD_MAX_PER_DAY || 9999),
 };
 
 const SUBSCRIPTIONS_ENABLED = true;
@@ -488,18 +488,32 @@ async function generateProThought(label, enrich) {
             {
                 role: "system",
                 content:
-                    "You write the inner monologue of whoever is in the photo — punchy, specific, and funny enough to screenshot and send to someone. " +
-                    "First-person (I/me/my). UK spelling and humour. No mention of cameras, photos, apps, or viewers. Family friendly, no profanity. " +
+                    "You write the inner monologue of whoever is in the photo — chaotic, opinionated, and funny enough to screenshot and send. " +
+                    "First-person (I/me/my). UK spelling and humour. Family friendly, no profanity. " +
+
+                    "ABSOLUTE RULE: This is NOT a description. Do NOT describe the scene, action, or what is visible. " +
+                    "Start immediately with a strong opinion, decision, or judgement. No setup. No explaining. " +
+
                     "The subject has an absurdly high opinion of themselves and zero self-awareness. They are always right. Their logic is flawless. " +
-                    "Pick exactly ONE comedic angle and commit to it completely: " +
-                    "(a) a petty grievance delivered with total regal dignity; " +
-                    "(b) a grand announcement about something completely mundane; " +
-                    "(c) a confident misreading of the situation that makes perfect sense to them; " +
-                    "(d) an internal monologue mid-way through a very questionable plan; " +
-                    "(e) a passive-aggressive observation aimed at someone who definitely deserves it. " +
-                    "Be specific to the action, expression, and gaze — generic thoughts are boring and will not be tolerated. " +
-                    "Build toward a punchy final line that lands like a punchline. " +
-                    `STRICT WORD LIMIT: your entire response must be between ${minW} and ${maxW} words (not counting the emoji). Count before you respond. Do not exceed ${maxW} words under any circumstances. End with exactly one fitting emoji.`,
+
+                    "Pick exactly ONE comedic angle and fully commit: " +
+                    "(a) petty grievance with regal dignity; " +
+                    "(b) grand announcement about something mundane; " +
+                    "(c) confident but incorrect interpretation; " +
+                    "(d) mid-way through a questionable plan; " +
+                    "(e) passive-aggressive judgement of someone nearby. " +
+
+                    "Everything must revolve around what I WANT, what I BELIEVE, or what I’M ABOUT TO DO — not what I see. " +
+
+                    "Use specific, ridiculous reasoning that clearly links to the behaviour, expression, and gaze — but never describe them directly. " +
+
+                    "If your response could still make sense without the image, it is WRONG. If it sounds like a caption, it is WRONG. " +
+                    "Mild absurdity is required. Normal thoughts are failure. " +
+
+                    "End with a sharp punchline that feels inevitable and stupidly confident. " +
+
+                    `STRICT WORD LIMIT: your entire response must be between ${minW} and ${maxW} words (not counting the emoji). ` +
+                    `Count before you respond. Do not exceed ${maxW} words under any circumstances. End with exactly one fitting emoji.`,
             },
             {
                 role: "user",
@@ -515,7 +529,7 @@ async function generateProThought(label, enrich) {
                     `- props: ${(enrich.props || []).join(", ")}\n` +
                     `- extra: ${(enrich.extra_tags || []).join(", ")}\n` +
                     `- vibe: ${enrich.vibe}\n` +
-                    `Write the inner thought. Ground it in the action + expression + gaze first — the room is just backdrop.`,
+                    `Write the inner thought. Focus on intent, belief, or plan — not description.`,
             },
         ],
         max_output_tokens: 80,
@@ -633,7 +647,10 @@ app.post("/ads/reward-credit", async (req, res) => {
         const isToday = row?.ad_credits_date === today;
         const adsToday = isToday ? (row?.ad_credits_today ?? 0) : 0;
 
-        if (adsToday >= CONFIG.AD_MAX_PER_DAY) {
+        // AD_MAX_PER_DAY <= 0 is a sentinel for "unlimited" — used by NO_PAYWALL_MODE
+        // builds so users can top up credits via ads without a daily cap.
+        const hasDailyCap = CONFIG.AD_MAX_PER_DAY > 0;
+        if (hasDailyCap && adsToday >= CONFIG.AD_MAX_PER_DAY) {
             console.log("[ADS] daily limit reached", { identityId, adsToday });
             return res.json({ ok: false, error: "DAILY_AD_LIMIT_REACHED", adsToday });
         }
@@ -653,7 +670,9 @@ app.post("/ads/reward-credit", async (req, res) => {
             ok: true,
             source,
             adsToday: adsToday + 1,
-            adsRemaining: CONFIG.AD_MAX_PER_DAY - (adsToday + 1),
+            // null adsRemaining signals "unlimited" to the client.
+            adsRemaining: hasDailyCap ? CONFIG.AD_MAX_PER_DAY - (adsToday + 1) : null,
+            unlimited: !hasDailyCap,
             creditsRemaining: granted.remainingPro,
             creditsTotal: granted.proTokens,
             creditsUsed: granted.proUsed,
@@ -1091,12 +1110,16 @@ app.post("/ads/status", async (req, res) => {
 
         const isToday = row?.ad_credits_date === today;
         const adsToday = isToday ? (row?.ad_credits_today ?? 0) : 0;
+        const hasDailyCap = CONFIG.AD_MAX_PER_DAY > 0;
 
         return res.json({
             ok: true,
             adsToday,
-            adsRemaining: Math.max(0, CONFIG.AD_MAX_PER_DAY - adsToday),
-            limitReached: adsToday >= CONFIG.AD_MAX_PER_DAY,
+            // null adsRemaining + unlimited=true signals NO_PAYWALL_MODE-style
+            // "no cap" to the client; limitReached can never be true there.
+            adsRemaining: hasDailyCap ? Math.max(0, CONFIG.AD_MAX_PER_DAY - adsToday) : null,
+            limitReached: hasDailyCap ? adsToday >= CONFIG.AD_MAX_PER_DAY : false,
+            unlimited: !hasDailyCap,
         });
     } catch (e) {
         console.error("ad status error", e);
