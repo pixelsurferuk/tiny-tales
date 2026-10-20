@@ -19,8 +19,8 @@ const CONFIG = {
     ASK_MIN_WORDS: 10,
     ASK_MAX_WORDS: 35,
 
-    CLASSIFY_MODEL: "meta-llama/llama-4-scout-17b-16e-instruct",
-    THOUGHT_MODEL:  "meta-llama/llama-4-scout-17b-16e-instruct",
+    CLASSIFY_MODEL: "qwen/qwen3.8-27b",
+    THOUGHT_MODEL: "qwen/qwen3.8-27b",
 
     DEFAULT_GUEST_PRO_BALANCE: Number(process.env.DEFAULT_GUEST_PRO_BALANCE || 3),
     DEFAULT_USER_PRO_BALANCE: Number(process.env.DEFAULT_USER_PRO_BALANCE || 0),
